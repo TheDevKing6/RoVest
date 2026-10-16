@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roblox Hidden Gems</title>
+<style>
+  :root {
+    --bg: #f3f4f1;
+    --surface: #ffffff;
+    --ink: #1b1f23;
+    --muted: #68707a;
+    --line: #dfe2dc;
+    --accent: #1f5eff;
+    --accent-ink: #ffffff;
+    --good: #12805c;
+    --warn: #b3261e;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a;
+      --surface: #1c2024;
+      --ink: #eceef0;
+      --muted: #9aa3ac;
+      --line: #2c3238;
+      --accent: #6c97ff;
+      --accent-ink: #0d1117;
+      --good: #4cc9a0;
+      --warn: #ff8a80;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.5;
+    padding: 32px 20px 64px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+  h1 { font-size: 1.75rem; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 0.95rem; margin-top: 2px; }
+
+  button, select, input {
+    font: inherit; color: inherit;
+  }
+  .btn {
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 600; cursor: pointer;
+  }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  .actions { display: flex; gap: 8px; }
+  .btn:focus-visible, .copy:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  .status {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 14px; font-size: 0.92rem;
+  }
+  .status-top { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .status .muted { color: var(--muted); }
+  .bar { height: 4px; background: var(--line); border-radius: 2px; margin-top: 10px; overflow: hidden; display: none; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .scanning .bar { display: block; }
+  .error { color: var(--warn); margin-top: 6px; }
+
+  .tools { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+  .tools input[type=search] {
+    flex: 1 1 220px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px;
+  }
+  .tools select {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+
+  .list { display: flex; flex-direction: column; gap: 8px; }
+  .row {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px;
+    display: grid; grid-template-columns: 1fr auto; gap: 10px 20px; align-items: center;
+  }
+  .title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .name { font-weight: 650; font-size: 1.05rem; word-break: break-word; }
+  .by { color: var(--muted); font-size: 0.88rem; margin-top: 2px; }
+  .stats { display: flex; gap: 22px; text-align: right; }
+  .stat b { display: block; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 0.78rem; }
+  .stat.ccu b { color: var(--good); }
+  .links { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.88rem; }
+  .links a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  .links a:hover { text-decoration: underline; }
+  .cmd {
+    flex: 1 1 100%; display: block;
+    font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 0.82rem;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 10px; word-break: break-all; user-select: all;
+  }
+
+  .copy {
+    background: transparent; border: 1px solid var(--line); border-radius: 6px;
+    padding: 2px 9px; font-size: 0.78rem; color: var(--muted); cursor: pointer; white-space: nowrap;
+  }
+  .copy:hover { border-color: var(--accent); color: var(--accent); }
+  .copy.done { border-color: var(--good); color: var(--good); }
+
+  .empty { text-align: center; color: var(--muted); padding: 56px 16px; }
+
+  .foot { margin-top: 28px; color: var(--muted); font-size: 0.8rem; text-align: center; }
+  .foot a { color: var(--muted); margin-left: 8px; }
+
+  @media (max-width: 620px) {
+    .row { grid-template-columns: 1fr; }
+    .stats { text-align: left; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Roblox Hidden Gems</h1>
+      <p class="sub" id="criteria">Loading filters…</p>
+    </div>
+    <div class="actions">
+      <button class="btn ghost" id="stop" hidden>Stop</button>
+      <button class="btn" id="rescan" hidden>Rescan</button>
+    </div>
+  </header>
+
+  <section class="status" id="status">
+    <div class="status-top">
+      <span id="stage">Connecting…</span>
+      <span class="muted" id="meta"></span>
+    </div>
+    <div class="bar"><i id="fill"></i></div>
+    <div class="error" id="error" hidden></div>
+  </section>
+
+  <div class="tools">
+    <input type="search" id="q" placeholder="Filter by game or creator name" aria-label="Filter results">
+    <select id="sort" aria-label="Sort results">
+      <option value="ccu">Most players now</option>
+      <option value="visits_asc">Fewest visits</option>
+      <option value="favorites">Most favorites</option>
+      <option value="ratio">Highest engagement</option>
+      <option value="name">Name A–Z</option>
+    </select>
+  </div>
+
+  <main class="list" id="list"></main>
+
+  <footer class="foot">
+    Unofficial tool, not affiliated with Roblox Corporation. Numbers come from Roblox's public web
+    APIs and refresh automatically.
+    <a href="#" id="adminlink" hidden>Admin</a>
+  </footer>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  let data = null;
+  let timer = null;
+  let isAdmin = false;
+
+  const getToken = () => { try { return localStorage.getItem("rgf_token") || ""; } catch (e) { return ""; } };
+  const authHeaders = () => ({ "X-Admin-Token": getToken() });
+
+  async function checkAdmin() {
+    try {
+      const r = await fetch("/api/me", { headers: authHeaders() });
+      isAdmin = (await r.json()).admin === true;
+    } catch (e) { isAdmin = false; }
+    $("adminlink").textContent = isAdmin && getToken() ? "Sign out" : "Admin";
+    if (data) renderStatus();
+  }
+
+  const fmt = n => Number(n).toLocaleString();
+
+  function copyText(text, btn) {
+    const done = () => {
+      const old = btn.textContent;
+      btn.textContent = "Copied";
+      btn.classList.add("done");
+      setTimeout(() => { btn.textContent = old; btn.classList.remove("done"); }, 1500);
+    };
+    // Clipboard API only works on localhost / https; fall back for LAN access
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
+    } else {
+      fallback(text, done);
+    }
+  }
+  function fallback(text, done) {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); } catch (e) { alert("Copy failed"); }
+    ta.remove();
+  }
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function copyBtn(label, value) {
+    const b = el("button", "copy", label);
+    b.type = "button";
+    b.addEventListener("click", () => copyText(value, b));
+    return b;
+  }
+  function stat(cls, value, label) {
+    const s = el("div", "stat " + cls);
+    s.append(el("b", "", value), el("span", "", label));
+    return s;
+  }
+
+  function sorted(list) {
+    const k = $("sort").value;
+    const c = [...list];
+    if (k === "ccu") c.sort((a, b) => b.ccu - a.ccu);
+    if (k === "visits_asc") c.sort((a, b) => a.visits - b.visits);
+    if (k === "favorites") c.sort((a, b) => b.favorites - a.favorites);
+    if (k === "ratio") c.sort((a, b) => b.ratio - a.ratio);
+    if (k === "name") c.sort((a, b) => a.name.localeCompare(b.name));
+    return c;
+  }
+
+  function renderList() {
+    const list = $("list");
+    list.replaceChildren();
+    if (!data) return;
+    const q = $("q").value.trim().toLowerCase();
+    const games = sorted(data.results.filter(g =>
+      !q || g.name.toLowerCase().includes(q) || g.creator.toLowerCase().includes(q)));
+
+    if (!games.length) {
+      let msg = "No games match these filters.";
+      if (data.status === "scanning" && !data.results.length) msg = "Scanning Roblox. Matches appear here as they are found.";
+      else if (data.status === "idle" && !data.results.length) msg = "No results yet. They will appear after the first scan.";
+      else if (q) msg = "No games match your search.";
+      list.append(el("div", "empty", msg));
+      return;
+    }
+
+    for (const g of games) {
+      const row = el("article", "row");
+
+      const left = el("div");
+      const title = el("div", "title");
+      title.append(el("span", "name", g.name), copyBtn("Copy name", g.name));
+      left.append(title, el("div", "by", "by " + g.creator));
+
+      const stats = el("div", "stats");
+      stats.append(
+        stat("ccu", fmt(g.ccu), "playing"),
+        stat("", fmt(g.visits), "visits"),
+        stat("", fmt(g.favorites), "favorites"),
+        stat("", g.ratio + "%", "engagement")
+      );
+
+      const links = el("div", "links");
+      const cmd = el("code", "cmd", g.command);
+      const a = el("a", "", "Open game");
+      a.href = g.url; a.target = "_blank"; a.rel = "noopener";
+      links.append(cmd, copyBtn("Copy command", g.command), copyBtn("Copy link", g.url), a);
+
+      row.append(left, stats, links);
+      list.append(row);
+    }
+  }
+
+  function renderStatus() {
+    const s = data;
+    const scanning = s.status === "scanning";
+    $("status").classList.toggle("scanning", scanning);
+    const canScan = isAdmin && s.config.scanner;
+    $("rescan").hidden = !canScan;
+    $("rescan").disabled = scanning;
+    $("rescan").textContent = scanning ? "Scanning…" : "Rescan";
+    $("stop").hidden = !(canScan && scanning);
+    $("fill").style.width = s.progress + "%";
+    $("stage").textContent = scanning ? s.stage
+      : s.status === "error" ? "Last scan failed"
+      : s.status === "idle" && !s.results.length ? "Waiting for the first scan results"
+      : `${fmt(s.results.length)} games match`;
+
+    const bits = [];
+    if (scanning) bits.push(`${fmt(s.results.length)} matches so far`);
+    if (scanning && s.eta_seconds != null) {
+      const m = Math.max(1, Math.round(s.eta_seconds / 60));
+      bits.push("about " + (m >= 90 ? (m / 60).toFixed(1) + " h" : m + " min") + " left");
+    }
+    if (!scanning && s.last_updated) bits.push("Updated " + new Date(s.last_updated).toLocaleString());
+    if (!scanning && s.analyzed) bits.push(`${fmt(s.analyzed)} checked`);
+    if (!scanning && s.botted) bits.push(`${fmt(s.botted)} dropped as likely botted`);
+    $("meta").textContent = bits.join("  ·  ");
+
+    const err = $("error");
+    err.hidden = !s.error;
+    err.textContent = s.error ? "The last scan failed, so these results may be out of date." : "";
+
+    const c = s.config;
+    $("criteria").textContent =
+      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits, ` +
+      `engagement below ${c.max_ratio}%`;
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch("state.json?t=" + Date.now());
+      const next = await res.json();
+      const finished = data && data.status === "scanning" && next.status !== "scanning";
+      const changed = !data || finished ||
+        next.last_updated !== data.last_updated || next.results.length !== data.results.length;
+      data = next;
+      renderStatus();
+      if (changed) renderList();
+    } catch (e) {
+      $("stage").textContent = "Can't reach the script. Is it still running?";
+    }
+    schedule();
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    // Poll quickly during a scan; otherwise just keep an eye out occasionally
+    timer = setTimeout(refresh, 120000);
+  }
+
+  $("rescan").addEventListener("click", async () => {
+    $("rescan").disabled = true;
+    await fetch("/api/rescan", { method: "POST", headers: authHeaders() });
+    refresh();
+  });
+  $("stop").addEventListener("click", async () => {
+    $("stop").disabled = true;
+    await fetch("/api/cancel", { method: "POST", headers: authHeaders() });
+    setTimeout(() => { $("stop").disabled = false; refresh(); }, 1500);
+  });
+  $("adminlink").addEventListener("click", (e) => {
+    e.preventDefault();
+    try {
+      if (isAdmin && getToken()) {
+        localStorage.removeItem("rgf_token");
+      } else {
+        const t = prompt("Admin token:");
+        if (t) localStorage.setItem("rgf_token", t.trim());
+      }
+    } catch (err) {}
+    checkAdmin();
+  });
+  $("q").addEventListener("input", renderList);
+  $("sort").addEventListener("change", renderList);
+
+  refresh();
+</script>
+</body>
+</html>
