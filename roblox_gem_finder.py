@@ -41,9 +41,8 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # reject huge uploads
 
 # ----------------------------- FILTER CRITERIA -----------------------------
-MIN_CCU = int(os.environ.get("MIN_CCU", 300))              # minimum concurrent players
+MIN_CCU = int(os.environ.get("MIN_CCU", 350))              # minimum concurrent players
 MAX_VISITS = int(os.environ.get("MAX_VISITS", 400_000))    # maximum total visits
-MAX_ENGAGEMENT_RATIO = 50    # CCU / visits in %. Above this = likely botted
 
 # ------------------------------- SETTINGS ----------------------------------
 PORT = int(os.environ.get("PORT", 5000))
@@ -438,7 +437,6 @@ state = {
     "progress": 0,           # 0-100
     "results": [],           # filtered games (list of dicts with raw numbers)
     "analyzed": 0,           # total games checked
-    "botted": 0,             # games dropped for suspicious engagement
     "last_updated": None,    # ISO timestamp of last finished scan
     "error": None,
     "queries_done": 0,
@@ -630,16 +628,12 @@ def build_command(name, url):
 
 
 def filter_games(games):
-    gems, botted = [], 0
+    gems = []
     for g in games:
         try:
             ccu = int(g.get("playing") or 0)
             visits = int(g.get("visits") or 0)
             if ccu < MIN_CCU or visits > MAX_VISITS:
-                continue
-            ratio = round(ccu / max(visits, 1) * 100, 3)
-            if ratio > MAX_ENGAGEMENT_RATIO:
-                botted += 1
                 continue
             name = g.get("name", "Unknown")
             url = f"https://www.roblox.com/games/{g.get('rootPlaceId')}"
@@ -650,13 +644,12 @@ def filter_games(games):
                 "ccu": ccu,
                 "visits": visits,
                 "favorites": int(g.get("favoritedCount") or 0),
-                "ratio": ratio,
                 "url": url,
             })
         except Exception as e:
             print(f"    Error processing a game: {e}")
     gems.sort(key=lambda x: x["ccu"], reverse=True)
-    return gems, botted
+    return gems
 
 
 # --------------------------------- SCAN ------------------------------------
@@ -668,7 +661,7 @@ def run_scan():
     seen = set()          # every unique universe ID found
     live = []             # matching games so far
     term_hits = {}        # word -> how many live games had it in their name
-    c = {"done": 0, "total": len(plan), "botted": 0, "skipped": 0, "snow": 0, "active": 0}
+    c = {"done": 0, "total": len(plan), "skipped": 0, "snow": 0, "active": 0}
     t0 = time.time()
 
     def add_snowball(name):
@@ -695,10 +688,9 @@ def run_scan():
         wanted = [g["universeId"] for g in new
                   if g["playerCount"] is None or g["playerCount"] >= PREFILTER_CCU]
         details = fetch_details(wanted) if wanted else []
-        gems, botted = filter_games(details)
+        gems = filter_games(details)
 
         with lock:
-            c["botted"] += botted
             c["skipped"] += len(new) - len(wanted)
             if gems:
                 live.extend(gems)
@@ -706,7 +698,7 @@ def run_scan():
                 for g in gems:  # print each match the moment it is found
                     print(f"✨ {g['ccu']:>6,} CCU {g['visits']:>8,} visits  (from '{query}')\n"
                           f"   {g['command']}")
-            set_state(results=list(live), analyzed=len(seen), botted=c["botted"])
+            set_state(results=list(live), analyzed=len(seen))
 
     def worker():
         while not cancel_event.is_set():
@@ -746,7 +738,7 @@ def run_scan():
               f"(+ up to {SNOWBALL_MAX:,} learned from live results)")
         print(f"   Rough time: {est_lo:.0f}-{est_lo * 3:.0f}+ minutes. Matches appear below and in the web UI as found.")
         print("=" * 70)
-        set_state(results=[], analyzed=0, botted=0, queries_done=0,
+        set_state(results=[], analyzed=0, queries_done=0,
                   queries_total=len(plan), eta_seconds=None)
 
         threads = [threading.Thread(target=worker, daemon=True) for _ in range(SEARCH_WORKERS)]
@@ -758,18 +750,18 @@ def run_scan():
         stopped = cancel_event.is_set()
         stamp = datetime.now().isoformat(timespec="seconds")
         set_state(status="done", stage="Stopped early" if stopped else "Scan complete",
-                  progress=100, results=list(live), analyzed=len(seen), botted=c["botted"],
+                  progress=100, results=list(live), analyzed=len(seen),
                   last_updated=stamp, error=None, eta_seconds=None)
         save_cache()
         push_results()
 
         print("\n" + "=" * 70)
         print(f"📊 Queries run: {c['done']:,}   Games found: {len(seen):,}   "
-              f"⏭️  Skipped (low player count): {c['skipped']:,}   🚫 Botted filtered: {c['botted']}")
+              f"⏭️  Skipped (low player count): {c['skipped']:,}")
         print(f"✨ Hidden gems found: {len(live)}" + ("   (stopped early)" if stopped else ""))
         print("=" * 70)
         for i, g in enumerate(live, 1):
-            print(f"{i:>3}. {g['ccu']:>7,} CCU  {g['visits']:>9,} visits  {g['ratio']:>7}%")
+            print(f"{i:>3}. {g['ccu']:>7,} CCU  {g['visits']:>9,} visits")
             print(f"     {g['command']}")
         print("=" * 70 + "\n")
 
@@ -802,8 +794,8 @@ def save_cache():
     s = snapshot()
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            payload = {k: s[k] for k in ("results", "analyzed", "botted", "last_updated")}
-            payload["criteria"] = [MIN_CCU, MAX_VISITS, MAX_ENGAGEMENT_RATIO, "cmd1"]
+            payload = {k: s[k] for k in ("results", "analyzed", "last_updated")}
+            payload["criteria"] = [MIN_CCU, MAX_VISITS, "cmd1"]
             json.dump(payload, f)
     except OSError as e:
         print(f"⚠️  Could not write cache: {e}")
@@ -814,11 +806,11 @@ def load_cache():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("criteria") != [MIN_CCU, MAX_VISITS, MAX_ENGAGEMENT_RATIO, "cmd1"]:
+        if data.get("criteria") != [MIN_CCU, MAX_VISITS, "cmd1"]:
             return None  # saved with different filters, so it would be misleading
         set_state(status="done", stage="Loaded saved results", progress=100,
                   results=data["results"], analyzed=data.get("analyzed", 0),
-                  botted=data.get("botted", 0), last_updated=data.get("last_updated"))
+                  last_updated=data.get("last_updated"))
         age = (datetime.now() - datetime.fromisoformat(data["last_updated"])).total_seconds() / 60
         return age
     except Exception:
@@ -863,7 +855,7 @@ def api_state():
     s = snapshot()
     s["error"] = "failed" if s["error"] else None   # never expose internal error text publicly
     s["config"] = {"min_ccu": MIN_CCU, "max_visits": MAX_VISITS,
-                   "max_ratio": MAX_ENGAGEMENT_RATIO, "scanner": ENABLE_SCANNER}
+                   "scanner": ENABLE_SCANNER}
     resp = jsonify(s)
     resp.headers["Cache-Control"] = "public, max-age=2"   # lets a CDN/browser absorb busy traffic
     return resp
@@ -909,7 +901,6 @@ def clean_results(items):
             "ccu": int(it["ccu"]),
             "visits": int(it["visits"]),
             "favorites": int(it.get("favorites", 0)),
-            "ratio": round(float(it.get("ratio", 0)), 3),
             "url": url,
         })
     return out
@@ -925,12 +916,12 @@ def api_ingest():
     body = request.get_json(silent=True) or {}
     try:
         results = clean_results(body.get("results"))
-        analyzed, botted = int(body.get("analyzed", 0)), int(body.get("botted", 0))
+        analyzed = int(body.get("analyzed", 0))
     except (KeyError, TypeError, ValueError) as e:
         return jsonify({"error": f"invalid payload: {e}"}), 400
     results.sort(key=lambda x: x["ccu"], reverse=True)
     set_state(status="done", stage="Updated from scanner", progress=100, results=results,
-              analyzed=analyzed, botted=botted, error=None,
+              analyzed=analyzed, error=None,
               last_updated=datetime.now().isoformat(timespec="seconds"))
     save_cache()
     return jsonify({"accepted": len(results)})
@@ -948,7 +939,7 @@ def push_results():
     for attempt in range(3):  # a sleeping free host can take ~1 minute to wake up
         try:
             r = requests.post(PUSH_URL + "/api/ingest",
-                              json={"results": s["results"], "analyzed": s["analyzed"], "botted": s["botted"]},
+                              json={"results": s["results"], "analyzed": s["analyzed"]},
                               headers={"X-Admin-Token": ADMIN_TOKEN, "User-Agent": HEADERS["User-Agent"]},
                               timeout=90)
             print(f"📤 Pushed {len(s['results'])} games to {PUSH_URL}  (HTTP {r.status_code})")
@@ -1125,7 +1116,6 @@ PAGE = r"""<!DOCTYPE html>
       <option value="ccu">Most players now</option>
       <option value="visits_asc">Fewest visits</option>
       <option value="favorites">Most favorites</option>
-      <option value="ratio">Highest engagement</option>
       <option value="name">Name A–Z</option>
     </select>
   </div>
@@ -1205,7 +1195,6 @@ PAGE = r"""<!DOCTYPE html>
     if (k === "ccu") c.sort((a, b) => b.ccu - a.ccu);
     if (k === "visits_asc") c.sort((a, b) => a.visits - b.visits);
     if (k === "favorites") c.sort((a, b) => b.favorites - a.favorites);
-    if (k === "ratio") c.sort((a, b) => b.ratio - a.ratio);
     if (k === "name") c.sort((a, b) => a.name.localeCompare(b.name));
     return c;
   }
@@ -1239,8 +1228,7 @@ PAGE = r"""<!DOCTYPE html>
       stats.append(
         stat("ccu", fmt(g.ccu), "playing"),
         stat("", fmt(g.visits), "visits"),
-        stat("", fmt(g.favorites), "favorites"),
-        stat("", g.ratio + "%", "engagement")
+        stat("", fmt(g.favorites), "favorites")
       );
 
       const links = el("div", "links");
@@ -1277,7 +1265,6 @@ PAGE = r"""<!DOCTYPE html>
     }
     if (!scanning && s.last_updated) bits.push("Updated " + new Date(s.last_updated).toLocaleString());
     if (!scanning && s.analyzed) bits.push(`${fmt(s.analyzed)} checked`);
-    if (!scanning && s.botted) bits.push(`${fmt(s.botted)} dropped as likely botted`);
     $("meta").textContent = bits.join("  ·  ");
 
     const err = $("error");
@@ -1286,8 +1273,7 @@ PAGE = r"""<!DOCTYPE html>
 
     const c = s.config;
     $("criteria").textContent =
-      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits, ` +
-      `engagement below ${c.max_ratio}%`;
+      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits`;
   }
 
   async function refresh() {
@@ -1353,7 +1339,7 @@ def export_static():
     s = snapshot()
     s.update(status="done", error=None, eta_seconds=None)
     s["config"] = {"min_ccu": MIN_CCU, "max_visits": MAX_VISITS,
-                   "max_ratio": MAX_ENGAGEMENT_RATIO, "scanner": False}
+                   "scanner": False}
     with open(os.path.join(EXPORT_DIR, "state.json"), "w", encoding="utf-8") as f:
         json.dump(s, f, separators=(",", ":"))
 
