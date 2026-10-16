@@ -1,0 +1,4 @@
+flask>=3.0
+requests>=2.31
+emoji>=2.10
+gunicorn>=22.0
