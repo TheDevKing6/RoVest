@@ -1,0 +1,44 @@
+# Put this file at  .github/workflows/scan.yml  in your GitHub repo.
+# It scans Roblox on a schedule and publishes the results to GitHub Pages (docs/ folder).
+name: Scan Roblox
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"     # every 6 hours (UTC). Change the 6 to 3 for every 3 hours.
+  workflow_dispatch:           # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write              # lets the job save the results back into the repo
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Scan Roblox
+        env:
+          ONE_SHOT: "1"
+          SCAN_MODE: standard        # quick | standard | deep | max
+          ONE_SHOT_MAX_MIN: "100"    # stop after this many minutes and publish what was found
+          EXPORT_DIR: docs
+        run: python roblox_gem_finder.py
+
+      - name: Publish results
+        run: |
+          git config user.name "scan-bot"
+          git config user.email "scan-bot@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || (git commit -m "Update results" && git push)
