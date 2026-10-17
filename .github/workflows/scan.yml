@@ -42,6 +42,10 @@ jobs:
           ONE_SHOT_MAX_MIN: "100"    # stop after this many minutes and publish what was found
           EXPORT_DIR: site_out
           PREV_DIR: prev
+          # Optional proxy: add a repository secret named SMARTPROXY_URL (see DEPLOY.md).
+          # Leave the secret out and no proxy is used.
+          SMARTPROXY_URL: ${{ secrets.SMARTPROXY_URL }}
+          MAX_PROXY_MB: "600"        # stop early after about this much proxy data (0 = no limit)
         run: python roblox_gem_finder.py
 
       - name: Publish website
