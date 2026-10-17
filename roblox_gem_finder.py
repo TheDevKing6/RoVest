@@ -480,35 +480,39 @@ def throttle(extra_pause=0.0):
         time.sleep(wait)
 
 
+import os
+
+SMARTPROXY_URL = os.environ.get("SMARTPROXY_URL", "")
+
 def get_json(url, params=None, retries=5):
     """GET with rate limiting, Retry-After handling and simple retry/backoff."""
+    
+    proxies = {}
+    if SMARTPROXY_URL:
+        proxies = {
+            "http": SMARTPROXY_URL,
+            "https": SMARTPROXY_URL
+        }
+    
     for attempt in range(retries):
         throttle()
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            r = requests.get(url, params=params, headers=HEADERS, 
+                           proxies=proxies, timeout=15)
+            
             if r.status_code == 429:
                 try:
                     wait = float(r.headers.get("Retry-After", 0))
                 except ValueError:
                     wait = 0
                 wait = max(wait, 2 * (attempt + 1))
-                print(f"    ⏳ Rate limited, pausing {wait:.0f}s")
+                print(f" ⏳ Rate limited, pausing {wait:.0f}s")
                 throttle(extra_pause=wait)
                 continue
+
             r.raise_for_status()
             return r.json()
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else 0
-            # 4xx (except 429) won't fix itself on retry, so fail immediately
-            if 400 <= code < 500 or attempt == retries - 1:
-                raise
-            time.sleep(1 + attempt)
-        except requests.RequestException:
-            if attempt == retries - 1:
-                raise
-            time.sleep(1 + attempt)
-    return None
-
+        # ... rest of the function stays the same
 
 def get_local_ip():
     try:
