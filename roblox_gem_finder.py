@@ -1,72 +1,76 @@
 """
-Roblox Hidden Gems Finder
--------------------------
-- Scans Roblox once in a BACKGROUND thread (not when you load the page).
-- Opening / refreshing http://localhost:5000 only shows stored results.
-- Results are cached to results_cache.json so restarting the script
-  doesn't force a new scan unless the cache is older than CACHE_MAX_AGE_MIN.
-- Every game that matches your filters is printed in the console and shown
-  in the web UI, with copy buttons for the name and link.
+Roblox Hidden Gems
+------------------
+Finds Roblox games that have real players but few total visits, tracks their player count over
+time, and shows them in a clean website with charts.
 
-Run locally:  pip install -r requirements.txt
-              python roblox_gem_finder.py
+- A background scan searches Roblox and keeps games with at least MIN_CCU players right now and
+  at most MAX_VISITS total visits.
+- Every game that qualifies is tracked: each scan and each quick "tracker" refresh adds a point
+  to its player-count history, which powers the charts.
+- Loading the page never starts a scan. It only shows stored results.
+
+Run locally:   pip install -r requirements.txt
+               python roblox_gem_finder.py          then open http://localhost:5000
+Keep index.html in the same folder as this file.
 
 Hosting it publicly: see DEPLOY.md. Settings can be changed with environment variables
-(ADMIN_TOKEN, SCAN_MODE, AUTO_SCAN_INTERVAL_MIN, ENABLE_SCANNER, PUSH_URL, DATA_DIR, ...).
+(MIN_CCU, MAX_VISITS, SCAN_MODE, ADMIN_TOKEN, AUTO_SCAN_INTERVAL_MIN, TRACK_INTERVAL_MIN, DATA_DIR, ...).
 """
 
 import hmac
 import json
+import os
 import random
 import re
-import os
 import socket
 import sys
 import threading
 import time
 import uuid
-from datetime import datetime
-
 from collections import deque
 
 import requests
 from flask import Flask, Response, jsonify, request
 
-try:
-    import emoji  # pip install emoji  (turns 🎨 into :art: for Discord)
-except ImportError:
-    emoji = None
-
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # reject huge uploads
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 # ----------------------------- FILTER CRITERIA -----------------------------
-MIN_CCU = int(os.environ.get("MIN_CCU", 350))              # minimum concurrent players
+MIN_CCU = int(os.environ.get("MIN_CCU", 350))              # minimum players right now
 MAX_VISITS = int(os.environ.get("MAX_VISITS", 400_000))    # maximum total visits
 
 # ------------------------------- SETTINGS ----------------------------------
 PORT = int(os.environ.get("PORT", 5000))
-DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-CACHE_FILE = os.path.join(DATA_DIR, "results_cache.json")
-CACHE_MAX_AGE_MIN = 30       # on startup, rescan automatically if the cache is older than this
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+CACHE_FILE = os.path.join(DATA_DIR, "results_cache.json")   # latest list shown on the page
+STORE_FILE = os.path.join(DATA_DIR, "history.json")         # player-count history for the charts
+CACHE_MAX_AGE_MIN = 30       # on startup, rescan automatically if saved results are older than this
+
+# How long / how much history to keep
+HISTORY_KEEP_DAYS = int(os.environ.get("HISTORY_KEEP_DAYS", 14))   # drop games that haven't qualified for this long
+HISTORY_MAX_POINTS = int(os.environ.get("HISTORY_MAX_POINTS", 800))  # data points kept per game
+HISTORY_MAX_GAMES = int(os.environ.get("HISTORY_MAX_GAMES", 3000))   # games tracked at once
 
 # ----------------------------- HOSTING SETTINGS ----------------------------
-# Set these as environment variables on your host (see DEPLOY.md).
-# ADMIN_TOKEN:            password for the Rescan / Stop buttons and for pushing results in.
+# ADMIN_TOKEN:            password for the Rescan / Stop buttons (the "Admin" link in the footer).
 #                         With no token set, only a direct localhost visit counts as admin.
-# ENABLE_SCANNER:         "0" makes this a viewer-only site that just shows results pushed to it.
-# AUTO_SCAN_INTERVAL_MIN: rescan automatically every N minutes (0 = only on startup / button).
-# PUSH_URL:               send results to another copy of this app, e.g. https://my-site.onrender.com
-# PUSH_INTERVAL_MIN:      how often to push while PUSH_URL is set.
+# AUTO_SCAN_INTERVAL_MIN: run a full scan every N minutes (0 = only on startup / button).
+# TRACK_INTERVAL_MIN:     refresh the player counts of tracked games every N minutes (0 = off).
+# ONE_SHOT=1:             run ONE full scan, write a static website into EXPORT_DIR, then exit.
+# TRACK_ONLY=1:           refresh tracked games only, write the static website, then exit.
+#                         (Both are used by the GitHub Actions workflows.)
+# PREV_DIR:               folder holding the previously published site, so history carries over.
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-ENABLE_SCANNER = os.environ.get("ENABLE_SCANNER", "1").strip().lower() not in ("0", "false", "no")
 AUTO_SCAN_INTERVAL_MIN = int(os.environ.get("AUTO_SCAN_INTERVAL_MIN", 0))
-PUSH_URL = os.environ.get("PUSH_URL", "").strip().rstrip("/")
-PUSH_INTERVAL_MIN = int(os.environ.get("PUSH_INTERVAL_MIN", 10))
-# ONE_SHOT=1: run ONE scan, write a static website into EXPORT_DIR (index.html + state.json), then
-# exit. Used by the GitHub Actions workflow so GitHub Pages can host the results for free.
-ONE_SHOT = os.environ.get("ONE_SHOT", "").strip().lower() in ("1", "true", "yes")
-EXPORT_DIR = os.environ.get("EXPORT_DIR", "docs")
+TRACK_INTERVAL_MIN = int(os.environ.get("TRACK_INTERVAL_MIN", 30))
+_truthy = lambda v: str(v).strip().lower() in ("1", "true", "yes")
+ONE_SHOT = _truthy(os.environ.get("ONE_SHOT", ""))
+TRACK_ONLY = _truthy(os.environ.get("TRACK_ONLY", ""))
+EXPORT_DIR = os.environ.get("EXPORT_DIR", "site_out")
+PREV_DIR = os.environ.get("PREV_DIR", "")
 ONE_SHOT_MAX_MIN = int(os.environ.get("ONE_SHOT_MAX_MIN", 100))  # stop scanning after this long and publish what was found
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -435,9 +439,11 @@ state = {
     "status": "idle",        # idle | scanning | done | error
     "stage": "",             # human-readable current step
     "progress": 0,           # 0-100
-    "results": [],           # filtered games (list of dicts with raw numbers)
-    "analyzed": 0,           # total games checked
-    "last_updated": None,    # ISO timestamp of last finished scan
+    "results": [],           # games shown on the page (already enriched for display)
+    "analyzed": 0,           # games checked so far in the current/last scan
+    "searched": 0,           # raw search hits (0 after a full scan means Roblox blocked us)
+    "last_updated": None,    # unix time of the last data refresh
+    "last_scan": None,       # unix time of the last full scan
     "error": None,
     "queries_done": 0,
     "queries_total": 0,
@@ -590,66 +596,189 @@ def fetch_details(universe_ids):
     return out
 
 
-# Built-in fallback so common emoji still convert if the 'emoji' package isn't installed.
-# (Anything not listed stays as the plain emoji character, which Discord also accepts.)
-FALLBACK_SHORTCODES = {
-    "🔥": ":fire:", "🎨": ":art:", "⭐": ":star:", "🌟": ":star2:", "✨": ":sparkles:",
-    "🎃": ":jack_o_lantern:", "🆕": ":new:", "⚡": ":zap:", "💎": ":gem:", "👑": ":crown:",
-    "🎮": ":video_game:", "💀": ":skull:", "🐟": ":fish:", "🥚": ":egg:", "🔪": ":knife:",
-    "🚨": ":rotating_light:", "🔦": ":flashlight:", "🌋": ":volcano:", "👾": ":space_invader:",
-    "🔮": ":crystal_ball:", "🦋": ":butterfly:", "🚒": ":fire_engine:", "😛": ":stuck_out_tongue:",
-    "🎵": ":musical_note:", "💥": ":boom:", "❤": ":heart:", "💯": ":100:", "🎉": ":tada:",
-    "🏆": ":trophy:", "💰": ":moneybag:", "🐱": ":cat:", "🐶": ":dog:", "👻": ":ghost:",
-    "🌱": ":seedling:", "🍀": ":four_leaf_clover:", "⚔": ":crossed_swords:", "🗡": ":dagger:",
-    "🚗": ":red_car:", "🏎": ":race_car:", "🚀": ":rocket:", "🌊": ":ocean:", "❄": ":snowflake:",
-    "☠": ":skull_and_crossbones:", "🎁": ":gift:", "🎲": ":game_die:", "🧪": ":test_tube:",
-    "🔔": ":bell:", "🛠": ":hammer_and_wrench:", "📢": ":loudspeaker:", "🆙": ":up:",
-    "✅": ":white_check_mark:", "❌": ":x:", "⚠": ":warning:", "🔒": ":lock:", "🥇": ":first_place:",
-}
+# ------------------------------- GAME DATA ---------------------------------
+def game_url(place_id):
+    return f"https://www.roblox.com/games/{place_id}"
 
 
-def to_discord_name(name):
-    """Game name with emoji turned into Discord shortcodes, e.g. '🎨 Mega Kamereon [NEW🔥]'
-    becomes ':art: Mega Kamereon [NEW:fire:]'."""
-    if emoji is not None:
-        try:
-            name = emoji.demojize(name, language="alias")      # emoji 2.x
-        except TypeError:
-            name = emoji.demojize(name, use_aliases=True)      # emoji 1.x
-    else:
-        name = name.replace("\ufe0f", "")                       # emoji variation selector
-        for char, code in FALLBACK_SHORTCODES.items():
-            name = name.replace(char, code)
-    return " ".join(name.split())  # no line breaks or double spaces in a slash command
+def to_gem(d):
+    """Turn one row of Roblox's games API into our simple game record (or None)."""
+    try:
+        uid, place = int(d.get("id") or 0), int(d.get("rootPlaceId") or 0)
+        if not uid or not place:
+            return None
+        return {
+            "id": uid,
+            "placeId": place,
+            "name": str(d.get("name") or "Unknown")[:120],
+            "creator": str((d.get("creator") or {}).get("name") or "Unknown")[:60],
+            "ccu": int(d.get("playing") or 0),
+            "visits": int(d.get("visits") or 0),
+            "favorites": int(d.get("favoritedCount") or 0),
+        }
+    except (TypeError, ValueError):
+        return None
 
 
-def build_command(name, url):
-    return f"/submit link:{url} name:{to_discord_name(name)}"
+def matches(g):
+    return g["ccu"] >= MIN_CCU and g["visits"] <= MAX_VISITS
 
 
-def filter_games(games):
-    gems = []
-    for g in games:
-        try:
-            ccu = int(g.get("playing") or 0)
-            visits = int(g.get("visits") or 0)
-            if ccu < MIN_CCU or visits > MAX_VISITS:
-                continue
-            name = g.get("name", "Unknown")
-            url = f"https://www.roblox.com/games/{g.get('rootPlaceId')}"
-            gems.append({
-                "name": name,
-                "command": build_command(name, url),
-                "creator": (g.get("creator") or {}).get("name", "Unknown"),
-                "ccu": ccu,
-                "visits": visits,
-                "favorites": int(g.get("favoritedCount") or 0),
-                "url": url,
-            })
-        except Exception as e:
-            print(f"    Error processing a game: {e}")
+def filter_games(details):
+    gems = [g for g in map(to_gem, details) if g and matches(g)]
     gems.sort(key=lambda x: x["ccu"], reverse=True)
     return gems
+
+
+# ------------------------------ HISTORY STORE ------------------------------
+# store["games"][str(universeId)] = {
+#   "n": name, "p": placeId, "c": creator, "f": favorites, "t": icon url or missing,
+#   "first": unix time first seen, "seen": unix time it last qualified,
+#   "pts": [[unix time, players, visits], ...]   (oldest first)
+# }
+store_lock = threading.Lock()
+store = {"games": {}}
+THUMB_RE = re.compile(r"^https://[a-z0-9.\-]+\.rbxcdn\.com/[\w\-./?=&%]+$", re.I)
+
+
+def _prune_locked(now):
+    games = store["games"]
+    cutoff = now - HISTORY_KEEP_DAYS * 86400
+    for k in [k for k, e in games.items() if e.get("seen", 0) < cutoff]:
+        del games[k]
+    if len(games) > HISTORY_MAX_GAMES:
+        oldest = sorted(games, key=lambda k: games[k].get("seen", 0))
+        for k in oldest[:len(games) - HISTORY_MAX_GAMES]:
+            del games[k]
+
+
+def hist_record(gems, matched=True, ts=None):
+    """Add one data point per game. matched=False records games that no longer qualify
+    (their line continues, but they don't count as 'seen' so they age out)."""
+    if not gems:
+        return
+    ts = ts or int(time.time())
+    with store_lock:
+        games = store["games"]
+        for g in gems:
+            key = str(g["id"])
+            e = games.get(key)
+            if e is None:
+                e = games[key] = {"first": ts, "seen": ts, "pts": []}
+            e["n"], e["p"], e["c"], e["f"] = g["name"], g["placeId"], g["creator"], g["favorites"]
+            if matched:
+                e["seen"] = ts
+            pts = e["pts"]
+            point = [ts, g["ccu"], g["visits"]]
+            if pts and ts - pts[-1][0] < 60:
+                pts[-1] = point                      # same minute: replace instead of stacking
+            else:
+                pts.append(point)
+            if len(pts) > HISTORY_MAX_POINTS:
+                del pts[:len(pts) - HISTORY_MAX_POINTS]
+        _prune_locked(ts)
+
+
+def save_store(path=None):
+    path = path or STORE_FILE
+    tmp = path + ".tmp"
+    try:
+        with store_lock:
+            blob = json.dumps(store, separators=(",", ":"))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(blob)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"⚠️  Could not save history: {e}")
+
+
+def load_store(path=None):
+    path = path or STORE_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        games = {}
+        for k, e in (data.get("games") or {}).items():
+            if str(k).isdigit() and isinstance(e.get("pts"), list):
+                games[str(k)] = e
+        with store_lock:
+            store["games"] = games
+        return len(games)
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def ensure_thumbs(ids):
+    """Fetch game icons (Roblox CDN links) for games that don't have one yet."""
+    with store_lock:
+        need = [i for i in ids if not store["games"].get(str(i), {}).get("t")]
+    for k in range(0, len(need), 100):
+        batch = need[k:k + 100]
+        try:
+            data = get_json("https://thumbnails.roblox.com/v1/games/icons",
+                            {"universeIds": ",".join(map(str, batch)), "returnPolicy": "PlaceHolder",
+                             "size": "150x150", "format": "Png", "isCircular": "false"})
+        except Exception as e:
+            print(f"    ⚠️  Icon fetch failed: {e}")
+            continue
+        with store_lock:
+            for it in (data or {}).get("data", []):
+                url = it.get("imageUrl")
+                e = store["games"].get(str(it.get("targetId")))
+                if e is not None and it.get("state") == "Completed" and isinstance(url, str) and THUMB_RE.match(url):
+                    e["t"] = url
+
+
+def refresh_tracked():
+    """Re-fetch current stats for every tracked game and add a history point for each.
+    Returns (games that still qualify, number of games Roblox returned)."""
+    with store_lock:
+        ids = [int(k) for k in store["games"]]
+    if not ids:
+        return [], 0
+    details = fetch_details(ids)
+    ts = int(time.time())
+    gems = [g for g in map(to_gem, details) if g]
+    hist_record([g for g in gems if matches(g)], matched=True, ts=ts)
+    hist_record([g for g in gems if not matches(g)], matched=False, ts=ts)
+    return [g for g in gems if matches(g)], len(details)
+
+
+def _spark(pts, n=40):
+    vals = [p[1] for p in pts]
+    if len(vals) <= n:
+        return vals
+    step = (len(vals) - 1) / (n - 1)
+    return [vals[round(i * step)] for i in range(n)]
+
+
+def _change_24h(pts):
+    """Percent change in players vs ~24h ago (None until there are 3+ hours of history)."""
+    if len(pts) < 2 or pts[-1][0] - pts[0][0] < 3 * 3600:
+        return None
+    target = pts[-1][0] - 86400
+    ref = min(pts, key=lambda p: abs(p[0] - target))
+    if ref[1] <= 0:
+        return None
+    return round((pts[-1][1] - ref[1]) / ref[1] * 100, 1)
+
+
+def publish_results(gems):
+    """Build the list the website shows: current stats plus icon, sparkline, peak, 24h change."""
+    out = []
+    with store_lock:
+        for g in gems:
+            e = store["games"].get(str(g["id"]), {})
+            pts = e.get("pts", [])
+            out.append({
+                "id": g["id"], "name": g["name"], "creator": g["creator"],
+                "ccu": g["ccu"], "visits": g["visits"], "favorites": g["favorites"],
+                "url": game_url(g["placeId"]), "thumb": e.get("t"),
+                "spark": _spark(pts), "peak": max([p[1] for p in pts] + [g["ccu"]]),
+                "d24": _change_24h(pts), "first": e.get("first"),
+            })
+    out.sort(key=lambda x: x["ccu"], reverse=True)
+    return out
 
 
 # --------------------------------- SCAN ------------------------------------
@@ -658,10 +787,11 @@ def run_scan():
     queue = deque(plan)
     queued = {q for q, _ in plan}
     lock = threading.Lock()
-    seen = set()          # every unique universe ID found
-    live = []             # matching games so far
+    seen = set()          # every unique universe ID found or already tracked
+    live = []             # games that qualify (tracked + newly found)
+    live_ids = set()
     term_hits = {}        # word -> how many live games had it in their name
-    c = {"done": 0, "total": len(plan), "skipped": 0, "snow": 0, "active": 0}
+    c = {"done": 0, "total": len(plan), "skipped": 0, "snow": 0, "active": 0, "found": 0}
     t0 = time.time()
 
     def add_snowball(name):
@@ -677,6 +807,7 @@ def run_scan():
     def process(query, pages):
         found = search_keyword(query, pages)
         with lock:
+            c["found"] += len(found)
             new = [g for g in found if g["universeId"] not in seen]
             seen.update(g["universeId"] for g in new)
             for g in new:
@@ -687,18 +818,24 @@ def run_scan():
         # Skip games whose live player count is clearly too low (unknown count = check it)
         wanted = [g["universeId"] for g in new
                   if g["playerCount"] is None or g["playerCount"] >= PREFILTER_CCU]
-        details = fetch_details(wanted) if wanted else []
-        gems = filter_games(details)
+        gems = filter_games(fetch_details(wanted)) if wanted else []
+
+        with lock:
+            fresh = [g for g in gems if g["id"] not in live_ids]
+            live_ids.update(g["id"] for g in fresh)
+        if fresh:
+            hist_record(fresh, matched=True)
+            ensure_thumbs([g["id"] for g in fresh])
 
         with lock:
             c["skipped"] += len(new) - len(wanted)
-            if gems:
-                live.extend(gems)
-                live.sort(key=lambda x: x["ccu"], reverse=True)
-                for g in gems:  # print each match the moment it is found
-                    print(f"✨ {g['ccu']:>6,} CCU {g['visits']:>8,} visits  (from '{query}')\n"
-                          f"   {g['command']}")
-            set_state(results=list(live), analyzed=len(seen))
+            if fresh:
+                live.extend(fresh)
+                for g in fresh:  # print each match the moment it is found
+                    print(f"✨ {g['ccu']:>6,} CCU {g['visits']:>8,} visits  {g['name'][:48]}  "
+                          f"{game_url(g['placeId'])}")
+                set_state(results=publish_results(live))
+            set_state(analyzed=len(seen), searched=c["found"])
 
     def worker():
         while not cancel_event.is_set():
@@ -730,16 +867,29 @@ def run_scan():
                     if done % 50 == 0:
                         print(f"[{done:,}/{total:,}] {len(live)} matches · {len(seen):,} games seen · "
                               f"{c['snow']} learned queries · ETA {(eta or 0) // 60} min")
+                    if done % 500 == 0:
+                        save_store()
 
     try:
         est_lo = len(plan) * REQUEST_GAP / 60
         print("\n" + "=" * 70)
         print(f"🔎 SCAN STARTED  mode={SCAN_MODE}  {len(plan):,} queries planned "
               f"(+ up to {SNOWBALL_MAX:,} learned from live results)")
-        print(f"   Rough time: {est_lo:.0f}-{est_lo * 3:.0f}+ minutes. Matches appear below and in the web UI as found.")
+        print(f"   Rough time: {est_lo:.0f}-{est_lo * 3:.0f}+ minutes. Matches appear in the web UI as found.")
         print("=" * 70)
-        set_state(results=[], analyzed=0, queries_done=0,
+        set_state(results=[], analyzed=0, searched=0, queries_done=0,
                   queries_total=len(plan), eta_seconds=None)
+
+        # Start from the games we already track (fresh stats), so the list is never empty
+        seeded, _ = refresh_tracked()
+        ensure_thumbs([g["id"] for g in seeded])
+        for g in seeded:
+            live.append(g)
+            live_ids.add(g["id"])
+            seen.add(g["id"])
+        if seeded:
+            print(f"Refreshed {len(seeded)} tracked games that still qualify.")
+            set_state(results=publish_results(live))
 
         threads = [threading.Thread(target=worker, daemon=True) for _ in range(SEARCH_WORKERS)]
         for t in threads:
@@ -748,21 +898,21 @@ def run_scan():
             t.join()
 
         stopped = cancel_event.is_set()
-        stamp = datetime.now().isoformat(timespec="seconds")
+        now = int(time.time())
         set_state(status="done", stage="Stopped early" if stopped else "Scan complete",
-                  progress=100, results=list(live), analyzed=len(seen),
-                  last_updated=stamp, error=None, eta_seconds=None)
+                  progress=100, results=publish_results(live), analyzed=len(seen),
+                  searched=c["found"], last_updated=now, last_scan=now, error=None, eta_seconds=None)
         save_cache()
-        push_results()
+        save_store()
 
         print("\n" + "=" * 70)
         print(f"📊 Queries run: {c['done']:,}   Games found: {len(seen):,}   "
               f"⏭️  Skipped (low player count): {c['skipped']:,}")
         print(f"✨ Hidden gems found: {len(live)}" + ("   (stopped early)" if stopped else ""))
         print("=" * 70)
-        for i, g in enumerate(live, 1):
-            print(f"{i:>3}. {g['ccu']:>7,} CCU  {g['visits']:>9,} visits")
-            print(f"     {g['command']}")
+        for i, g in enumerate(sorted(live, key=lambda x: x["ccu"], reverse=True), 1):
+            print(f"{i:>3}. {g['ccu']:>7,} CCU  {g['visits']:>9,} visits  {g['name'][:45]}")
+            print(f"     {game_url(g['placeId'])}")
         print("=" * 70 + "\n")
 
     except Exception as e:
@@ -771,14 +921,11 @@ def run_scan():
 
 
 last_scan_attempt = 0.0
-last_push = 0.0
 
 
 def start_scan():
     """Start a scan in the background unless one is already running."""
     global last_scan_attempt
-    if not ENABLE_SCANNER:
-        return False
     with state_lock:
         if state["status"] == "scanning":
             return False
@@ -789,37 +936,68 @@ def start_scan():
     return True
 
 
+def track_once():
+    """Quick refresh: new stats and a new chart point for every tracked game (no searching)."""
+    if snapshot()["status"] == "scanning":
+        return
+    gems, n = refresh_tracked()
+    if not n:
+        return
+    ensure_thumbs([g["id"] for g in gems])
+    results = publish_results(gems)
+    with state_lock:
+        if state["status"] != "scanning":
+            state.update(results=results, last_updated=int(time.time()),
+                         status="done", stage="Updated")
+    save_cache()
+    save_store()
+    print(f"⏱️  Tracker refreshed {n} games ({len(gems)} still qualify).")
+
+
 # --------------------------------- CACHE -----------------------------------
+CACHE_VERSION = [MIN_CCU, MAX_VISITS, "v4"]
+
+
 def save_cache():
     s = snapshot()
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            payload = {k: s[k] for k in ("results", "analyzed", "last_updated")}
-            payload["criteria"] = [MIN_CCU, MAX_VISITS, "cmd1"]
-            json.dump(payload, f)
+            json.dump({"results": s["results"], "analyzed": s["analyzed"],
+                       "last_updated": s["last_updated"], "last_scan": s["last_scan"],
+                       "criteria": CACHE_VERSION}, f)
     except OSError as e:
         print(f"⚠️  Could not write cache: {e}")
 
 
 def load_cache():
-    """Load cached results. Returns the cache age in minutes, or None if no cache."""
+    """Load saved results. Returns their age in minutes, or None if there is nothing usable."""
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("criteria") != [MIN_CCU, MAX_VISITS, "cmd1"]:
-            return None  # saved with different filters, so it would be misleading
+        if data.get("criteria") != CACHE_VERSION or not data.get("last_updated"):
+            return None  # saved with different filters or an older format
         set_state(status="done", stage="Loaded saved results", progress=100,
                   results=data["results"], analyzed=data.get("analyzed", 0),
-                  last_updated=data.get("last_updated"))
-        age = (datetime.now() - datetime.fromisoformat(data["last_updated"])).total_seconds() / 60
-        return age
+                  last_updated=data["last_updated"], last_scan=data.get("last_scan"))
+        return (time.time() - data["last_updated"]) / 60
     except Exception:
         return None
 
 
 # --------------------------------- ROUTES ----------------------------------
+def read_index():
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+INDEX_HTML = read_index()
+
+
 def is_admin():
-    """True if the request may start/stop scans or push results."""
+    """True if the request may start/stop scans."""
     if ADMIN_TOKEN:
         sent = request.headers.get("X-Admin-Token", "")
         return hmac.compare_digest(sent.encode(), ADMIN_TOKEN.encode())
@@ -835,14 +1013,21 @@ def security_headers(resp):
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        "img-src https://*.rbxcdn.com data:; connect-src 'self'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'")
     return resp
 
 
 @app.route("/")
 def home():
     # Only serves the page. Never starts a scan.
-    return Response(PAGE, mimetype="text/html")
+    html = INDEX_HTML or read_index()
+    if html is None:
+        return Response("index.html is missing. Put it in the same folder as roblox_gem_finder.py.",
+                        status=500, mimetype="text/plain")
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.route("/healthz")
@@ -854,10 +1039,21 @@ def healthz():
 def api_state():
     s = snapshot()
     s["error"] = "failed" if s["error"] else None   # never expose internal error text publicly
-    s["config"] = {"min_ccu": MIN_CCU, "max_visits": MAX_VISITS,
-                   "scanner": ENABLE_SCANNER}
+    s["config"] = {"min_ccu": MIN_CCU, "max_visits": MAX_VISITS, "static": False}
     resp = jsonify(s)
-    resp.headers["Cache-Control"] = "public, max-age=2"   # lets a CDN/browser absorb busy traffic
+    resp.headers["Cache-Control"] = "public, max-age=2"
+    return resp
+
+
+@app.route("/api/history/<int:game_id>")
+def api_history(game_id):
+    with store_lock:
+        e = store["games"].get(str(game_id))
+        data = None if e is None else {"id": game_id, "name": e.get("n", ""), "pts": list(e["pts"])}
+    if data is None:
+        return jsonify({"error": "not tracked"}), 404
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "public, max-age=30"
     return resp
 
 
@@ -883,483 +1079,75 @@ def api_rescan():
     return jsonify({"started": start_scan()})
 
 
-def clean_results(items):
-    """Validate results sent to /api/ingest. Only known fields are kept, and the Discord
-    command is rebuilt here so nothing the sender wrote is trusted."""
-    if not isinstance(items, list) or len(items) > 5000:
-        raise ValueError("results must be a list of at most 5000 games")
-    out = []
-    for it in items:
-        name = str(it["name"])[:200]
-        url = str(it["url"])
-        if not re.fullmatch(r"https://www\.roblox\.com/games/\d{1,20}", url):
-            raise ValueError("bad game url")
-        out.append({
-            "name": name,
-            "command": build_command(name, url),
-            "creator": str(it.get("creator", "Unknown"))[:80],
-            "ccu": int(it["ccu"]),
-            "visits": int(it["visits"]),
-            "favorites": int(it.get("favorites", 0)),
-            "url": url,
-        })
-    return out
-
-
-@app.route("/api/ingest", methods=["POST"])
-def api_ingest():
-    """Lets a scanner running elsewhere (e.g. your home PC) fill this site with results."""
-    if not ADMIN_TOKEN or not is_admin():
-        return jsonify({"error": "forbidden"}), 403
-    if snapshot()["status"] == "scanning":
-        return jsonify({"error": "this server is scanning itself"}), 409
-    body = request.get_json(silent=True) or {}
-    try:
-        results = clean_results(body.get("results"))
-        analyzed = int(body.get("analyzed", 0))
-    except (KeyError, TypeError, ValueError) as e:
-        return jsonify({"error": f"invalid payload: {e}"}), 400
-    results.sort(key=lambda x: x["ccu"], reverse=True)
-    set_state(status="done", stage="Updated from scanner", progress=100, results=results,
-              analyzed=analyzed, error=None,
-              last_updated=datetime.now().isoformat(timespec="seconds"))
-    save_cache()
-    return jsonify({"accepted": len(results)})
-
-
-def push_results():
-    """Send current results to PUSH_URL (the public site), if configured."""
-    global last_push
-    if not (PUSH_URL and ADMIN_TOKEN):
-        return
-    last_push = time.time()
-    s = snapshot()
-    if not s["results"]:
-        return
-    for attempt in range(3):  # a sleeping free host can take ~1 minute to wake up
-        try:
-            r = requests.post(PUSH_URL + "/api/ingest",
-                              json={"results": s["results"], "analyzed": s["analyzed"]},
-                              headers={"X-Admin-Token": ADMIN_TOKEN, "User-Agent": HEADERS["User-Agent"]},
-                              timeout=90)
-            print(f"📤 Pushed {len(s['results'])} games to {PUSH_URL}  (HTTP {r.status_code})")
-            return
-        except requests.RequestException as e:
-            print(f"⚠️  Push attempt {attempt + 1}/3 to {PUSH_URL} failed: {e}")
-            time.sleep(20)
-
-
 def scheduler_loop():
-    """Background timer: periodic rescans and periodic pushes to the public site."""
+    """Background timer: periodic full scans and periodic quick tracker refreshes."""
+    last_track = time.time()
     while True:
         time.sleep(30)
         try:
             status = snapshot()["status"]
-            if (ENABLE_SCANNER and AUTO_SCAN_INTERVAL_MIN > 0 and status != "scanning"
+            if (AUTO_SCAN_INTERVAL_MIN > 0 and status != "scanning"
                     and time.time() - last_scan_attempt >= AUTO_SCAN_INTERVAL_MIN * 60):
                 print("⏰ Scheduled rescan starting...")
                 start_scan()
-            if PUSH_URL and time.time() - last_push >= PUSH_INTERVAL_MIN * 60:
-                push_results()
+            elif (TRACK_INTERVAL_MIN > 0 and status != "scanning"
+                    and time.time() - last_track >= TRACK_INTERVAL_MIN * 60):
+                last_track = time.time()
+                track_once()
         except Exception as e:
             print(f"⚠️  Scheduler error: {e}")
 
 
-# ----------------------------------- UI ------------------------------------
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Roblox Hidden Gems</title>
-<style>
-  :root {
-    --bg: #f3f4f1;
-    --surface: #ffffff;
-    --ink: #1b1f23;
-    --muted: #68707a;
-    --line: #dfe2dc;
-    --accent: #1f5eff;
-    --accent-ink: #ffffff;
-    --good: #12805c;
-    --warn: #b3261e;
-    color-scheme: light;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14171a;
-      --surface: #1c2024;
-      --ink: #eceef0;
-      --muted: #9aa3ac;
-      --line: #2c3238;
-      --accent: #6c97ff;
-      --accent-ink: #0d1117;
-      --good: #4cc9a0;
-      --warn: #ff8a80;
-      color-scheme: dark;
-    }
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-    background: var(--bg);
-    color: var(--ink);
-    line-height: 1.5;
-    padding: 32px 20px 64px;
-  }
-  .wrap { max-width: 980px; margin: 0 auto; }
-
-  header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
-  h1 { font-size: 1.75rem; font-weight: 650; letter-spacing: -0.01em; }
-  .sub { color: var(--muted); font-size: 0.95rem; margin-top: 2px; }
-
-  button, select, input {
-    font: inherit; color: inherit;
-  }
-  .btn {
-    background: var(--accent); color: var(--accent-ink);
-    border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 600; cursor: pointer;
-  }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-  .actions { display: flex; gap: 8px; }
-  .btn:focus-visible, .copy:focus-visible, select:focus-visible, input:focus-visible {
-    outline: 2px solid var(--accent); outline-offset: 2px;
-  }
-
-  .status {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
-    padding: 14px 16px; margin-bottom: 14px; font-size: 0.92rem;
-  }
-  .status-top { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-  .status .muted { color: var(--muted); }
-  .bar { height: 4px; background: var(--line); border-radius: 2px; margin-top: 10px; overflow: hidden; display: none; }
-  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
-  .scanning .bar { display: block; }
-  .error { color: var(--warn); margin-top: 6px; }
-
-  .tools { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
-  .tools input[type=search] {
-    flex: 1 1 220px; background: var(--surface); border: 1px solid var(--line);
-    border-radius: 8px; padding: 8px 12px;
-  }
-  .tools select {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
-  }
-
-  .list { display: flex; flex-direction: column; gap: 8px; }
-  .row {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
-    padding: 14px 16px;
-    display: grid; grid-template-columns: 1fr auto; gap: 10px 20px; align-items: center;
-  }
-  .title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .name { font-weight: 650; font-size: 1.05rem; word-break: break-word; }
-  .by { color: var(--muted); font-size: 0.88rem; margin-top: 2px; }
-  .stats { display: flex; gap: 22px; text-align: right; }
-  .stat b { display: block; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
-  .stat span { color: var(--muted); font-size: 0.78rem; }
-  .stat.ccu b { color: var(--good); }
-  .links { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.88rem; }
-  .links a { color: var(--accent); text-decoration: none; word-break: break-all; }
-  .links a:hover { text-decoration: underline; }
-  .cmd {
-    flex: 1 1 100%; display: block;
-    font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 0.82rem;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
-    padding: 7px 10px; word-break: break-all; user-select: all;
-  }
-
-  .copy {
-    background: transparent; border: 1px solid var(--line); border-radius: 6px;
-    padding: 2px 9px; font-size: 0.78rem; color: var(--muted); cursor: pointer; white-space: nowrap;
-  }
-  .copy:hover { border-color: var(--accent); color: var(--accent); }
-  .copy.done { border-color: var(--good); color: var(--good); }
-
-  .empty { text-align: center; color: var(--muted); padding: 56px 16px; }
-
-  .foot { margin-top: 28px; color: var(--muted); font-size: 0.8rem; text-align: center; }
-  .foot a { color: var(--muted); margin-left: 8px; }
-
-  @media (max-width: 620px) {
-    .row { grid-template-columns: 1fr; }
-    .stats { text-align: left; }
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <div>
-      <h1>Roblox Hidden Gems</h1>
-      <p class="sub" id="criteria">Loading filters…</p>
-    </div>
-    <div class="actions">
-      <button class="btn ghost" id="stop" hidden>Stop</button>
-      <button class="btn" id="rescan" hidden>Rescan</button>
-    </div>
-  </header>
-
-  <section class="status" id="status">
-    <div class="status-top">
-      <span id="stage">Connecting…</span>
-      <span class="muted" id="meta"></span>
-    </div>
-    <div class="bar"><i id="fill"></i></div>
-    <div class="error" id="error" hidden></div>
-  </section>
-
-  <div class="tools">
-    <input type="search" id="q" placeholder="Filter by game or creator name" aria-label="Filter results">
-    <select id="sort" aria-label="Sort results">
-      <option value="ccu">Most players now</option>
-      <option value="visits_asc">Fewest visits</option>
-      <option value="favorites">Most favorites</option>
-      <option value="name">Name A–Z</option>
-    </select>
-  </div>
-
-  <main class="list" id="list"></main>
-
-  <footer class="foot">
-    Unofficial tool, not affiliated with Roblox Corporation. Numbers come from Roblox's public web
-    APIs and refresh automatically.
-    <a href="#" id="adminlink">Admin</a>
-  </footer>
-</div>
-
-<script>
-  const $ = id => document.getElementById(id);
-  let data = null;
-  let timer = null;
-  let isAdmin = false;
-
-  const getToken = () => { try { return localStorage.getItem("rgf_token") || ""; } catch (e) { return ""; } };
-  const authHeaders = () => ({ "X-Admin-Token": getToken() });
-
-  async function checkAdmin() {
-    try {
-      const r = await fetch("/api/me", { headers: authHeaders() });
-      isAdmin = (await r.json()).admin === true;
-    } catch (e) { isAdmin = false; }
-    $("adminlink").textContent = isAdmin && getToken() ? "Sign out" : "Admin";
-    if (data) renderStatus();
-  }
-
-  const fmt = n => Number(n).toLocaleString();
-
-  function copyText(text, btn) {
-    const done = () => {
-      const old = btn.textContent;
-      btn.textContent = "Copied";
-      btn.classList.add("done");
-      setTimeout(() => { btn.textContent = old; btn.classList.remove("done"); }, 1500);
-    };
-    // Clipboard API only works on localhost / https; fall back for LAN access
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
-    } else {
-      fallback(text, done);
-    }
-  }
-  function fallback(text, done) {
-    const ta = document.createElement("textarea");
-    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); done(); } catch (e) { alert("Copy failed"); }
-    ta.remove();
-  }
-
-  function el(tag, cls, text) {
-    const e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text !== undefined) e.textContent = text;
-    return e;
-  }
-  function copyBtn(label, value) {
-    const b = el("button", "copy", label);
-    b.type = "button";
-    b.addEventListener("click", () => copyText(value, b));
-    return b;
-  }
-  function stat(cls, value, label) {
-    const s = el("div", "stat " + cls);
-    s.append(el("b", "", value), el("span", "", label));
-    return s;
-  }
-
-  function sorted(list) {
-    const k = $("sort").value;
-    const c = [...list];
-    if (k === "ccu") c.sort((a, b) => b.ccu - a.ccu);
-    if (k === "visits_asc") c.sort((a, b) => a.visits - b.visits);
-    if (k === "favorites") c.sort((a, b) => b.favorites - a.favorites);
-    if (k === "name") c.sort((a, b) => a.name.localeCompare(b.name));
-    return c;
-  }
-
-  function renderList() {
-    const list = $("list");
-    list.replaceChildren();
-    if (!data) return;
-    const q = $("q").value.trim().toLowerCase();
-    const games = sorted(data.results.filter(g =>
-      !q || g.name.toLowerCase().includes(q) || g.creator.toLowerCase().includes(q)));
-
-    if (!games.length) {
-      let msg = "No games match these filters.";
-      if (data.status === "scanning" && !data.results.length) msg = "Scanning Roblox. Matches appear here as they are found.";
-      else if (data.status === "idle" && !data.results.length) msg = "No results yet. They will appear after the first scan.";
-      else if (q) msg = "No games match your search.";
-      list.append(el("div", "empty", msg));
-      return;
-    }
-
-    for (const g of games) {
-      const row = el("article", "row");
-
-      const left = el("div");
-      const title = el("div", "title");
-      title.append(el("span", "name", g.name), copyBtn("Copy name", g.name));
-      left.append(title, el("div", "by", "by " + g.creator));
-
-      const stats = el("div", "stats");
-      stats.append(
-        stat("ccu", fmt(g.ccu), "playing"),
-        stat("", fmt(g.visits), "visits"),
-        stat("", fmt(g.favorites), "favorites")
-      );
-
-      const links = el("div", "links");
-      const cmd = el("code", "cmd", g.command);
-      const a = el("a", "", "Open game");
-      a.href = g.url; a.target = "_blank"; a.rel = "noopener";
-      links.append(cmd, copyBtn("Copy command", g.command), copyBtn("Copy link", g.url), a);
-
-      row.append(left, stats, links);
-      list.append(row);
-    }
-  }
-
-  function renderStatus() {
-    const s = data;
-    const scanning = s.status === "scanning";
-    $("status").classList.toggle("scanning", scanning);
-    const canScan = isAdmin && s.config.scanner;
-    $("rescan").hidden = !canScan;
-    $("rescan").disabled = scanning;
-    $("rescan").textContent = scanning ? "Scanning…" : "Rescan";
-    $("stop").hidden = !(canScan && scanning);
-    $("fill").style.width = s.progress + "%";
-    $("stage").textContent = scanning ? s.stage
-      : s.status === "error" ? "Last scan failed"
-      : s.status === "idle" && !s.results.length ? "Waiting for the first scan results"
-      : `${fmt(s.results.length)} games match`;
-
-    const bits = [];
-    if (scanning) bits.push(`${fmt(s.results.length)} matches so far`);
-    if (scanning && s.eta_seconds != null) {
-      const m = Math.max(1, Math.round(s.eta_seconds / 60));
-      bits.push("about " + (m >= 90 ? (m / 60).toFixed(1) + " h" : m + " min") + " left");
-    }
-    if (!scanning && s.last_updated) bits.push("Updated " + new Date(s.last_updated).toLocaleString());
-    if (!scanning && s.analyzed) bits.push(`${fmt(s.analyzed)} checked`);
-    $("meta").textContent = bits.join("  ·  ");
-
-    const err = $("error");
-    err.hidden = !s.error;
-    err.textContent = s.error ? "The last scan failed, so these results may be out of date." : "";
-
-    const c = s.config;
-    $("criteria").textContent =
-      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits`;
-  }
-
-  async function refresh() {
-    try {
-      const res = await fetch("/api/state");
-      const next = await res.json();
-      const finished = data && data.status === "scanning" && next.status !== "scanning";
-      const changed = !data || finished ||
-        next.last_updated !== data.last_updated || next.results.length !== data.results.length;
-      data = next;
-      renderStatus();
-      if (changed) renderList();
-    } catch (e) {
-      $("stage").textContent = "Can't reach the script. Is it still running?";
-    }
-    schedule();
-  }
-
-  function schedule() {
-    clearTimeout(timer);
-    // Poll quickly during a scan; otherwise just keep an eye out occasionally
-    timer = setTimeout(refresh, data && data.status === "scanning" ? 3000 : 15000);
-  }
-
-  $("rescan").addEventListener("click", async () => {
-    $("rescan").disabled = true;
-    await fetch("/api/rescan", { method: "POST", headers: authHeaders() });
-    refresh();
-  });
-  $("stop").addEventListener("click", async () => {
-    $("stop").disabled = true;
-    await fetch("/api/cancel", { method: "POST", headers: authHeaders() });
-    setTimeout(() => { $("stop").disabled = false; refresh(); }, 1500);
-  });
-  $("adminlink").addEventListener("click", (e) => {
-    e.preventDefault();
-    try {
-      if (isAdmin && getToken()) {
-        localStorage.removeItem("rgf_token");
-      } else {
-        const t = prompt("Admin token:");
-        if (t) localStorage.setItem("rgf_token", t.trim());
-      }
-    } catch (err) {}
-    checkAdmin();
-  });
-  $("q").addEventListener("input", renderList);
-  $("sort").addEventListener("change", renderList);
-
-  checkAdmin();
-  refresh();
-</script>
-</body>
-</html>
-"""
-
-
-# ---------------------------------- MAIN -----------------------------------
 # ------------------------- STATIC SITE EXPORT (free hosting) ----------------
 def export_static():
-    """Write index.html + state.json so any static host (GitHub Pages) can serve the results."""
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    s = snapshot()
-    s.update(status="done", error=None, eta_seconds=None)
-    s["config"] = {"min_ccu": MIN_CCU, "max_visits": MAX_VISITS,
-                   "scanner": False}
-    with open(os.path.join(EXPORT_DIR, "state.json"), "w", encoding="utf-8") as f:
-        json.dump(s, f, separators=(",", ":"))
+    """Write a complete static website (page + data files) that GitHub Pages can serve."""
+    html = INDEX_HTML or read_index()
+    if html is None:
+        raise SystemExit("index.html is missing next to roblox_gem_finder.py")
+    flag = "const STATIC = false;"
+    if flag not in html:
+        raise SystemExit("index.html no longer contains the STATIC flag, cannot export")
 
-    page = PAGE
-    edits = [
-        ('fetch("/api/state")', 'fetch("state.json?t=" + Date.now())'),          # read the file, not an API
-        ('data && data.status === "scanning" ? 3000 : 15000', '120000'),         # data changes every few hours
-        ('  checkAdmin();\n  refresh();', '  refresh();'),                         # no admin on a static site
-        ('<a href="#" id="adminlink">Admin</a>', '<a href="#" id="adminlink" hidden>Admin</a>'),
-    ]
-    for old, new in edits:
-        assert old in page, f"page template changed, cannot export: {old}"
-        page = page.replace(old, new)
-    with open(os.path.join(EXPORT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(page)
-    open(os.path.join(EXPORT_DIR, ".nojekyll"), "w").close()   # tell GitHub Pages not to post-process
+    out = EXPORT_DIR
+    os.makedirs(os.path.join(out, "h"), exist_ok=True)
+    s = snapshot()
+    payload = {k: s[k] for k in ("results", "analyzed", "last_updated", "last_scan")}
+    payload.update(status="done", error=None,
+                   config={"min_ccu": MIN_CCU, "max_visits": MAX_VISITS, "static": True})
+    with open(os.path.join(out, "state.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+
+    with store_lock:
+        games = dict(store["games"])
+    with open(os.path.join(out, "store.json"), "w", encoding="utf-8") as f:
+        json.dump({"games": games}, f, separators=(",", ":"))
+    for gid, e in games.items():                       # one small file per game for the charts
+        with open(os.path.join(out, "h", f"{gid}.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": int(gid), "name": e.get("n", ""), "pts": e["pts"]}, f, separators=(",", ":"))
+
+    with open(os.path.join(out, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html.replace(flag, "const STATIC = true;", 1))
+    open(os.path.join(out, ".nojekyll"), "w").close()   # tell GitHub Pages not to post-process
+    print(f"✅ Static site written to '{out}/' ({len(payload['results'])} games, {len(games)} charts)")
+
+
+def load_prev():
+    """Restore history (and the last-scan time) from the previously published site."""
+    if not PREV_DIR:
+        return
+    n = load_store(os.path.join(PREV_DIR, "store.json"))
+    try:
+        with open(os.path.join(PREV_DIR, "state.json"), "r", encoding="utf-8") as f:
+            prev = json.load(f)
+        set_state(last_scan=prev.get("last_scan"), analyzed=prev.get("analyzed", 0))
+    except (OSError, ValueError):
+        pass
+    print(f"Restored history for {n} games from '{PREV_DIR}'." if n else "No previous history found, starting fresh.")
 
 
 def run_once():
-    """One scan, then publish a static site and exit (used by GitHub Actions)."""
+    """One full scan, then publish a static site and exit (used by GitHub Actions)."""
+    load_prev()
     print(f"ONE_SHOT scan: mode={SCAN_MODE}, stops after {ONE_SHOT_MAX_MIN} min, exports to '{EXPORT_DIR}/'")
     set_state(status="scanning", stage="Starting…", progress=0, error=None)
     cancel_event.clear()
@@ -1369,12 +1157,28 @@ def run_once():
     run_scan()
     timer.cancel()
     s = snapshot()
-    if s["status"] == "error" or s["analyzed"] == 0:
+    if s["status"] == "error" or s["searched"] == 0:
         print("❌ The scan found no games at all. Roblox may be blocking this server's IP address.\n"
-              "   Leaving the published results unchanged.")
+              "   Leaving the published site unchanged.")
         sys.exit(1)
     export_static()
-    print(f"✅ Static site written to '{EXPORT_DIR}/' ({len(s['results'])} matches)")
+
+
+def run_track():
+    """Refresh tracked games only, publish a static site and exit (used by GitHub Actions)."""
+    load_prev()
+    with store_lock:
+        tracked = len(store["games"])
+    if not tracked:
+        print("Nothing is tracked yet. Run the full scan first. Nothing published.")
+        return
+    gems, n = refresh_tracked()
+    if not n:
+        print("❌ Roblox returned no data for the tracked games (blocked?). Leaving the site unchanged.")
+        sys.exit(1)
+    ensure_thumbs([g["id"] for g in gems])
+    set_state(status="done", stage="Updated", results=publish_results(gems), last_updated=int(time.time()))
+    export_static()
 
 
 # --------------------------------- STARTUP ---------------------------------
@@ -1391,34 +1195,34 @@ def bootstrap():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    if emoji is None:
-        print("ℹ️  Tip: run  pip install emoji  so names like '🎨 Game' become ':art: Game' in the Discord command.")
+    if INDEX_HTML is None:
+        print("⚠️  index.html not found next to this script. The website will not load.")
     if not ADMIN_TOKEN:
         print("ℹ️  No ADMIN_TOKEN set: Rescan/Stop work only when opened directly on localhost.")
 
+    tracked = load_store()
     age = load_cache()
+    if tracked:
+        print(f"Loaded history for {tracked} tracked games.")
     if age is not None:
         last_scan_attempt = time.time() - age * 60
 
-    if ENABLE_SCANNER:
-        max_age = AUTO_SCAN_INTERVAL_MIN or CACHE_MAX_AGE_MIN
-        if age is None:
-            print("No saved results found. Starting first scan...")
-            start_scan()
-        elif age > max_age:
-            print(f"Saved results are {age:.0f} min old. Rescanning in the background...")
-            start_scan()
-        else:
-            print(f"Loaded saved results ({age:.0f} min old, {len(state['results'])} games).")
+    max_age = AUTO_SCAN_INTERVAL_MIN or CACHE_MAX_AGE_MIN
+    if age is None:
+        print("No saved results found. Starting first scan...")
+        start_scan()
+    elif age > max_age:
+        print(f"Saved results are {age:.0f} min old. Rescanning in the background...")
+        start_scan()
     else:
-        print("Viewer-only mode (ENABLE_SCANNER=0): showing results sent to /api/ingest.")
+        print(f"Loaded saved results ({age:.0f} min old, {len(state['results'])} games).")
 
-    if (ENABLE_SCANNER and AUTO_SCAN_INTERVAL_MIN > 0) or PUSH_URL:
+    if AUTO_SCAN_INTERVAL_MIN > 0 or TRACK_INTERVAL_MIN > 0:
         threading.Thread(target=scheduler_loop, daemon=True).start()
 
 
 # Set RGF_NO_BOOT=1 to import this file (e.g. for tests) without starting a scan.
-if not os.environ.get("RGF_NO_BOOT") and not ONE_SHOT:
+if not os.environ.get("RGF_NO_BOOT") and not (ONE_SHOT or TRACK_ONLY):
     bootstrap()
 
 
@@ -1426,9 +1230,13 @@ if __name__ == "__main__":
     if ONE_SHOT:
         run_once()
         sys.exit(0)
+    if TRACK_ONLY:
+        run_track()
+        sys.exit(0)
+
     local_ip = get_local_ip()
     print("\n" + "=" * 70)
-    print("🚀 Roblox Hidden Gems Finder")
+    print("💎 Roblox Hidden Gems")
     print("=" * 70)
     print(f"   Localhost: http://localhost:{PORT}")
     print(f"   Network:   http://{local_ip}:{PORT}")
