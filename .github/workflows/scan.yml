@@ -1,5 +1,5 @@
 # Put this file at  .github/workflows/scan.yml  in your GitHub repo.
-# It scans Roblox on a schedule and publishes the results to GitHub Pages (docs/ folder).
+# Full scan: searches Roblox for new hidden gems, then publishes the website to the "site" branch.
 name: Scan Roblox
 
 on:
@@ -8,10 +8,10 @@ on:
   workflow_dispatch:           # adds a "Run workflow" button in the Actions tab
 
 permissions:
-  contents: write              # lets the job save the results back into the repo
+  contents: write              # lets the job publish the "site" branch
 
 concurrency:
-  group: scan
+  group: publish               # scan and tracker never run at the same time
   cancel-in-progress: false
 
 jobs:
@@ -20,6 +20,13 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore previous data (chart history)
+        uses: actions/checkout@v4
+        continue-on-error: true          # fails harmlessly on the very first run
+        with:
+          ref: site
+          path: prev
 
       - uses: actions/setup-python@v5
         with:
@@ -33,12 +40,16 @@ jobs:
           ONE_SHOT: "1"
           SCAN_MODE: standard        # quick | standard | deep | max
           ONE_SHOT_MAX_MIN: "100"    # stop after this many minutes and publish what was found
-          EXPORT_DIR: docs
+          EXPORT_DIR: site_out
+          PREV_DIR: prev
         run: python roblox_gem_finder.py
 
-      - name: Publish results
+      - name: Publish website
         run: |
+          cd site_out
+          git init -q -b site
           git config user.name "scan-bot"
           git config user.email "scan-bot@users.noreply.github.com"
-          git add docs
-          git diff --cached --quiet || (git commit -m "Update results" && git push)
+          git add -A
+          git commit -q -m "Update $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" site
