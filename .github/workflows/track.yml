@@ -1,0 +1,55 @@
+# Put this file at  .github/workflows/track.yml  in your GitHub repo.
+# Quick tracker: every 30 minutes it re-reads the player counts of games already on the list
+# and adds a point to their charts. It takes about a minute and doesn't search for new games.
+name: Track player counts
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"     # twice an hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore previous data (chart history)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          ref: site
+          path: prev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Refresh tracked games
+        env:
+          TRACK_ONLY: "1"
+          EXPORT_DIR: site_out
+          PREV_DIR: prev
+        run: python roblox_gem_finder.py
+
+      - name: Publish website
+        run: |
+          if [ ! -f site_out/index.html ]; then echo "Nothing to publish yet (run the scan workflow first)."; exit 0; fi
+          cd site_out
+          git init -q -b site
+          git config user.name "scan-bot"
+          git config user.email "scan-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Track $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" site
