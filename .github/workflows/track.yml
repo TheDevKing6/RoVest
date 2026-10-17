@@ -41,6 +41,7 @@ jobs:
           TRACK_ONLY: "1"
           EXPORT_DIR: site_out
           PREV_DIR: prev
+          SMARTPROXY_URL: ${{ secrets.SMARTPROXY_URL }}   # optional, see DEPLOY.md
         run: python roblox_gem_finder.py
 
       - name: Publish website
