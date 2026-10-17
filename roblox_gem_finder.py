@@ -76,8 +76,21 @@ try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except OSError:
     pass
-SEARCH_WORKERS = 6           # queries processed in parallel
-REQUEST_GAP = 0.12           # min seconds between ANY two requests (shared by all workers)
+# Optional proxy. Set SMARTPROXY_URL in your host's environment variables, for example:
+#   http://USERNAME:PASSWORD@HOST:PORT
+# Never write the real URL into this file or commit it to GitHub.
+# (On GitHub Actions, save it as a repository secret named SMARTPROXY_URL, see DEPLOY.md.)
+PROXY_URL = os.environ.get("SMARTPROXY_URL", "").strip()
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+# Proxy plans are usually billed per GB. A scan stops early once this many MB have been
+# downloaded through the proxy (0 = no limit). Each scan prints how much it used.
+MAX_PROXY_MB = int(os.environ.get("MAX_PROXY_MB", 0))
+
+# Speed settings. They are slower by default without a proxy, because Roblox limits requests per IP.
+# If Roblox answers "rate limited", the script also slows itself down automatically and speeds
+# back up when things are calm.
+SEARCH_WORKERS = int(os.environ.get("SEARCH_WORKERS", 6 if PROXY_URL else 4))      # queries in parallel
+REQUEST_GAP = float(os.environ.get("REQUEST_GAP", 0.1 if PROXY_URL else 0.35))     # min seconds between ANY two requests
 # Search results already include a live player count, so games well below the
 # minimum are skipped without fetching their stats (this is the big speed-up).
 # Set to 0 to fetch stats for every game found.
@@ -465,6 +478,38 @@ def snapshot():
 # ------------------------------- NETWORKING --------------------------------
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
+_gap = REQUEST_GAP        # current spacing: grows after rate limits, shrinks back when calm
+_ok_streak = 0
+_usage = {"requests": 0, "bytes": 0}
+_usage_lock = threading.Lock()
+
+
+def safe_err(e):
+    """Error text with the proxy address and login removed, safe to print or log."""
+    text = str(e)
+    if PROXY_URL:
+        text = text.replace(PROXY_URL, "[proxy]")
+        m = re.match(r"^[a-z0-9+.\-]+://([^:@/]+):([^@]+)@", PROXY_URL, re.I)
+        if m:
+            for part in (m.group(2), m.group(1)):
+                if len(part) >= 4:
+                    text = text.replace(part, "***")
+    return text
+
+
+def usage_report():
+    with _usage_lock:
+        n, mb = _usage["requests"], _usage["bytes"] / 1e6
+    return n, mb
+
+
+def _check_budget():
+    """Stop the scan if a proxy data limit (MAX_PROXY_MB) has been reached."""
+    if PROXIES and MAX_PROXY_MB and not cancel_event.is_set():
+        _, mb = usage_report()
+        if mb >= MAX_PROXY_MB:
+            print(f"⛔ Reached the proxy data limit ({MAX_PROXY_MB} MB). Stopping the scan early.")
+            cancel_event.set()
 
 
 def throttle(extra_pause=0.0):
@@ -475,44 +520,87 @@ def throttle(extra_pause=0.0):
         if extra_pause:
             _next_allowed = max(_next_allowed, now + extra_pause)
         wait = _next_allowed - now
-        _next_allowed = max(_next_allowed, now) + REQUEST_GAP
+        _next_allowed = max(_next_allowed, now) + _gap
     if wait > 0:
         time.sleep(wait)
 
 
-import os
-
-SMARTPROXY_URL = os.environ.get("SMARTPROXY_URL", "")
-
 def get_json(url, params=None, retries=5):
-    """GET with rate limiting, Retry-After handling and simple retry/backoff."""
-    
-    proxies = {}
-    if SMARTPROXY_URL:
-        proxies = {
-            "http": SMARTPROXY_URL,
-            "https": SMARTPROXY_URL
-        }
-    
+    """GET with rate limiting, Retry-After handling, adaptive slow-down and retry/backoff.
+    Uses the proxy from SMARTPROXY_URL when one is set."""
+    global _gap, _ok_streak
     for attempt in range(retries):
         throttle()
         try:
-            r = requests.get(url, params=params, headers=HEADERS, 
-                           proxies=proxies, timeout=15)
-            
+            r = requests.get(url, params=params, headers=HEADERS, proxies=PROXIES, timeout=20)
+            with _usage_lock:
+                _usage["requests"] += 1
+                _usage["bytes"] += int(r.headers.get("Content-Length") or len(r.content))
             if r.status_code == 429:
                 try:
                     wait = float(r.headers.get("Retry-After", 0))
                 except ValueError:
                     wait = 0
                 wait = max(wait, 2 * (attempt + 1))
-                print(f" ⏳ Rate limited, pausing {wait:.0f}s")
+                with _throttle_lock:
+                    _gap = min(2.0, _gap * 1.5)      # slow down for everyone
+                    _ok_streak = 0
+                    gap_now = _gap
+                print(f"    ⏳ Rate limited, pausing {wait:.0f}s (requests now spaced {gap_now:.2f}s apart)")
                 throttle(extra_pause=wait)
                 continue
-
             r.raise_for_status()
-            return r.json()
-        # ... rest of the function stays the same
+            data = r.json()
+            with _throttle_lock:
+                _ok_streak += 1
+                if _ok_streak >= 60 and _gap > REQUEST_GAP:   # calm for a while: speed back up
+                    _gap = max(REQUEST_GAP, _gap / 1.25)
+                    _ok_streak = 0
+            _check_budget()
+            return data
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            # 4xx (except 429) won't fix itself on retry, so fail immediately
+            if 400 <= code < 500 or attempt == retries - 1:
+                raise
+            time.sleep(1 + attempt)
+        except requests.exceptions.ProxyError as e:
+            if "407" in str(e):   # wrong proxy username/password: retrying can't help
+                raise RuntimeError("The proxy rejected the login (407). Check SMARTPROXY_URL.") from None
+            if attempt == retries - 1:
+                raise
+            time.sleep(1 + attempt)
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1 + attempt)
+    return None
+
+
+def check_proxy():
+    """True if no proxy is configured or the proxy can reach Roblox. Prints what it found."""
+    if not PROXIES:
+        return True
+    try:
+        r = requests.get("https://apis.roblox.com/search-api/omni-search",
+                         params={"searchQuery": "obby", "sessionId": str(uuid.uuid4()), "pageType": "all"},
+                         headers=HEADERS, proxies=PROXIES, timeout=25)
+    except Exception as e:
+        print(f"❌ Proxy check failed: {safe_err(e)}\n"
+              "   Check SMARTPROXY_URL (format http://USER:PASSWORD@HOST:PORT) and that your plan has data left.")
+        return False
+    try:   # purely informational: which address Roblox sees
+        ip = requests.get("https://api.ipify.org", proxies=PROXIES, timeout=15).text.strip()
+    except Exception:
+        ip = "unknown address"
+    if r.status_code == 429:
+        print(f"⚠️  Proxy works ({ip}) but Roblox is already rate limiting it. The script will slow down.")
+    elif r.status_code >= 400:
+        print(f"⚠️  Proxy works ({ip}) but Roblox answered HTTP {r.status_code}.")
+    else:
+        print(f"🔌 Proxy OK. Roblox sees requests coming from {ip}.")
+    return True
+
 
 def get_local_ip():
     try:
@@ -554,7 +642,7 @@ def search_keyword(keyword, pages=2):
             except Exception:
                 pass  # page 2 is a bonus
     except Exception as e:
-        print(f"    ⚠️  Search failed for '{keyword}': {e}")
+        print(f"    ⚠️  Search failed for '{keyword}': {safe_err(e)}")
     return found
 
 
@@ -575,10 +663,10 @@ def fetch_batch(batch):
             mid = len(batch) // 2
             time.sleep(0.2)
             return fetch_batch(batch[:mid]) + fetch_batch(batch[mid:])
-        print(f"    ⚠️  Details batch failed: {e}")
+        print(f"    ⚠️  Details batch failed: {safe_err(e)}")
         return []
     except Exception as e:
-        print(f"    ⚠️  Details batch failed: {e}")
+        print(f"    ⚠️  Details batch failed: {safe_err(e)}")
         return []
 
 
@@ -723,7 +811,7 @@ def ensure_thumbs(ids):
                             {"universeIds": ",".join(map(str, batch)), "returnPolicy": "PlaceHolder",
                              "size": "150x150", "format": "Png", "isCircular": "false"})
         except Exception as e:
-            print(f"    ⚠️  Icon fetch failed: {e}")
+            print(f"    ⚠️  Icon fetch failed: {safe_err(e)}")
             continue
         with store_lock:
             for it in (data or {}).get("data", []):
@@ -857,7 +945,7 @@ def run_scan():
             try:
                 process(query, pages)
             except Exception as e:
-                print(f"    ⚠️  Query '{query}' failed: {e}")
+                print(f"    ⚠️  Query '{query}' failed: {safe_err(e)}")
             finally:
                 with lock:
                     c["active"] -= 1
@@ -880,6 +968,8 @@ def run_scan():
         print(f"🔎 SCAN STARTED  mode={SCAN_MODE}  {len(plan):,} queries planned "
               f"(+ up to {SNOWBALL_MAX:,} learned from live results)")
         print(f"   Rough time: {est_lo:.0f}-{est_lo * 3:.0f}+ minutes. Matches appear in the web UI as found.")
+        print(f"   Proxy: {'ON' if PROXIES else 'off'}   request spacing: {REQUEST_GAP}s   workers: {SEARCH_WORKERS}"
+              + (f"   data limit: {MAX_PROXY_MB} MB" if PROXIES and MAX_PROXY_MB else ""))
         print("=" * 70)
         set_state(results=[], analyzed=0, searched=0, queries_done=0,
                   queries_total=len(plan), eta_seconds=None)
@@ -913,6 +1003,9 @@ def run_scan():
         print(f"📊 Queries run: {c['done']:,}   Games found: {len(seen):,}   "
               f"⏭️  Skipped (low player count): {c['skipped']:,}")
         print(f"✨ Hidden gems found: {len(live)}" + ("   (stopped early)" if stopped else ""))
+        n_req, mb = usage_report()
+        print(f"📶 {n_req:,} requests to Roblox, about {mb:.0f} MB downloaded"
+              + ("  (counts against your proxy plan)" if PROXIES else ""))
         print("=" * 70)
         for i, g in enumerate(sorted(live, key=lambda x: x["ccu"], reverse=True), 1):
             print(f"{i:>3}. {g['ccu']:>7,} CCU  {g['visits']:>9,} visits  {g['name'][:45]}")
@@ -920,8 +1013,8 @@ def run_scan():
         print("=" * 70 + "\n")
 
     except Exception as e:
-        print(f"❌ Scan failed: {e}")
-        set_state(status="error", stage="Scan failed", error=str(e))
+        print(f"❌ Scan failed: {safe_err(e)}")
+        set_state(status="error", stage="Scan failed", error=safe_err(e))
 
 
 last_scan_attempt = 0.0
@@ -1151,6 +1244,8 @@ def load_prev():
 
 def run_once():
     """One full scan, then publish a static site and exit (used by GitHub Actions)."""
+    if not check_proxy():
+        sys.exit(1)
     load_prev()
     print(f"ONE_SHOT scan: mode={SCAN_MODE}, stops after {ONE_SHOT_MAX_MIN} min, exports to '{EXPORT_DIR}/'")
     set_state(status="scanning", stage="Starting…", progress=0, error=None)
@@ -1170,6 +1265,8 @@ def run_once():
 
 def run_track():
     """Refresh tracked games only, publish a static site and exit (used by GitHub Actions)."""
+    if not check_proxy():
+        sys.exit(1)
     load_prev()
     with store_lock:
         tracked = len(store["games"])
@@ -1203,6 +1300,7 @@ def bootstrap():
         print("⚠️  index.html not found next to this script. The website will not load.")
     if not ADMIN_TOKEN:
         print("ℹ️  No ADMIN_TOKEN set: Rescan/Stop work only when opened directly on localhost.")
+    check_proxy()
 
     tracked = load_store()
     age = load_cache()
