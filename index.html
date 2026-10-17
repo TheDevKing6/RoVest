@@ -134,10 +134,19 @@
     grid-template-columns: 30px minmax(0, 1fr) 112px 112px 84px 84px;
     padding: 0 16px;
   }
-  .head { height: 38px; color: var(--muted); font-size: .76rem; font-weight: 600; border-bottom: 1px solid var(--line); background: var(--soft); }
+  .head { padding-right: 58px; height: 38px; color: var(--muted); font-size: .76rem; font-weight: 600; border-bottom: 1px solid var(--line); background: var(--soft); }
   .r { text-align: right; }
   .row { min-height: 66px; text-decoration: none; border-bottom: 1px solid var(--line); cursor: pointer; }
-  .row:last-child { border-bottom: 0; }
+  #list > .rw:last-child .row, #list > .row:last-child { border-bottom: 0; }
+  .rw { position: relative; }
+  .rw .row { padding-right: 58px; }
+  .rowcopy {
+    position: absolute; right: 12px; top: 50%; transform: translateY(-50%); width: 32px; height: 32px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted);
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+  }
+  .rowcopy:hover { color: var(--accent); border-color: var(--accent); }
+  .rowcopy svg { width: 16px; height: 16px; }
   .row:hover { background: var(--soft); }
   .rank { color: var(--muted); font-size: .84rem; }
   .game { display: flex; align-items: center; gap: 12px; min-width: 0; }
@@ -158,7 +167,7 @@
   .spark.flat polyline { stroke: var(--muted); }
   .dash { color: var(--muted); }
   .mstats { display: none; }
-  .more { display: block; width: 100%; border: 0; border-top: 1px solid var(--line); background: var(--surface); padding: 12px; cursor: pointer; color: var(--accent); font-weight: 600; }
+  .more { display: block; width: 100%; border: 0; background: var(--surface); padding: 12px; cursor: pointer; color: var(--accent); font-weight: 600; }
   .more:hover { background: var(--soft); }
   .empty { padding: 56px 20px; text-align: center; color: var(--muted); }
   .empty b { display: block; color: var(--text); margin-bottom: 4px; font-size: 1.02rem; }
@@ -200,6 +209,15 @@
   .cell { background: var(--surface); padding: 12px 14px; }
   .cell span { color: var(--muted); font-size: .78rem; display: block; }
   .cell b { font-size: 1.12rem; font-weight: 650; }
+  .copyrows { display: flex; flex-direction: column; }
+  .crow { display: grid; grid-template-columns: 74px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 0; }
+  .crow + .crow { border-top: 1px solid var(--line); }
+  .crow > span { color: var(--muted); font-size: .8rem; font-weight: 600; }
+  .crow code {
+    font-family: Consolas, "SF Mono", Menlo, monospace; font-size: .8rem; background: var(--soft);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .crow .btn { height: 30px; padding: 0 10px; font-size: .82rem; }
 
   .toast {
     position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; transition: .2s; z-index: 80;
@@ -216,6 +234,8 @@
     .stat b { font-size: 1.12rem; }
     .head { display: none; }
     .row { grid-template-columns: minmax(0, 1fr) auto; padding: 10px 14px; }
+    .rw .row { padding: 10px 56px 10px 14px; }
+    .rowcopy { right: 10px; }
     .rank, .c-spark, .c-vis, .c-fav { display: none; }
     .mstats { display: block; }
     .gsub.desk { display: none; }
@@ -413,6 +433,11 @@
     return { rows: r, counts };
   }
 
+  // /submit link: <game link> name: <game name>, e.g. /submit link: https://www.roblox.com/games/123 name: [♠️SHADOW♠️] CloverFall
+  const cleanName = (g) => g.name.replace(/\s+/g, " ").trim();
+  const cmdText = (g) => "/submit link: " + g.url + " name: " + cleanName(g);
+  const COPY_ICON = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="9" height="9" rx="2"/><path d="M13 7V5a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2"/></svg>';
+
   function icon(g, cls) {
     if (g.thumb) {
       const i = el("img", "ico" + (cls ? " " + cls : ""));
@@ -423,7 +448,7 @@
     return placeholder(g.name, cls);
   }
   function placeholder(name, cls) {
-    const d = el("div", "ico ph" + (cls ? " " + cls : ""), (name.trim()[0] || "?").toUpperCase());
+    const d = el("div", "ico ph" + (cls ? " " + cls : ""), ((name.match(/[\p{L}\p{N}]/u) || ["?"])[0]).toUpperCase());
     d.setAttribute("aria-hidden", "true");
     return d;
   }
@@ -445,7 +470,7 @@
     return el("span", "delta " + (g.d24 > 0.4 ? "up" : g.d24 < -0.4 ? "down" : ""), t);
   }
 
-  function row(g, i) {
+  function rowLink(g, i) {
     const a = el("a", "row"); a.href = "#g=" + g.id;
     a.appendChild(el("span", "rank num", String(i + 1)));
     const game = el("div", "game");
@@ -462,6 +487,17 @@
     a.appendChild(el("span", "r num c-vis", compact(g.visits)));
     a.appendChild(el("span", "r num c-fav", compact(g.favorites)));
     return a;
+  }
+
+  function row(g, i) {
+    const w = el("div", "rw");
+    w.appendChild(rowLink(g, i));
+    const b = el("button", "rowcopy"); b.type = "button";
+    b.setAttribute("aria-label", "Copy submit command for " + g.name); b.title = "Copy submit command";
+    b.innerHTML = COPY_ICON;
+    b.addEventListener("click", () => copy(cmdText(g), "Command"));
+    w.appendChild(b);
+    return w;
   }
 
   function renderList() {
@@ -623,10 +659,20 @@
       const open = el("a", "btn primary", "Open on Roblox ↗"); open.href = g.url; open.target = "_blank"; open.rel = "noopener";
       acts.appendChild(open);
     }
-    const cl = el("button", "btn", "Copy page link"); cl.addEventListener("click", () => copy(location.origin + location.pathname + "#g=" + S.panelId, "Link"));
-    acts.appendChild(cl);
-    if (g) { const cn = el("button", "btn", "Copy name"); cn.addEventListener("click", () => copy(g.name, "Name")); acts.appendChild(cn); }
+    const share = el("button", "btn", "Share this page"); share.addEventListener("click", () => copy(location.origin + location.pathname + "#g=" + S.panelId, "Page link"));
+    acts.appendChild(share);
     pin.appendChild(acts);
+
+    if (g) {
+      const cc = el("div", "card"); const rows = el("div", "copyrows");
+      [["Name", cleanName(g), "Name"], ["Link", g.url, "Link"], ["Command", cmdText(g), "Command"]].forEach(([label, value, what]) => {
+        const r = el("div", "crow"); r.appendChild(el("span", "", label));
+        const c = el("code", "", value); c.title = value; r.appendChild(c);
+        const b = el("button", "btn", "Copy"); b.addEventListener("click", () => copy(value, what)); r.appendChild(b);
+        rows.appendChild(r);
+      });
+      cc.appendChild(rows); pin.appendChild(cc);
+    }
 
     const card = el("div", "card");
     const top = el("div", "c-top");
