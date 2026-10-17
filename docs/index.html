@@ -148,7 +148,6 @@
       <option value="ccu">Most players now</option>
       <option value="visits_asc">Fewest visits</option>
       <option value="favorites">Most favorites</option>
-      <option value="ratio">Highest engagement</option>
       <option value="name">Name A–Z</option>
     </select>
   </div>
@@ -228,7 +227,6 @@
     if (k === "ccu") c.sort((a, b) => b.ccu - a.ccu);
     if (k === "visits_asc") c.sort((a, b) => a.visits - b.visits);
     if (k === "favorites") c.sort((a, b) => b.favorites - a.favorites);
-    if (k === "ratio") c.sort((a, b) => b.ratio - a.ratio);
     if (k === "name") c.sort((a, b) => a.name.localeCompare(b.name));
     return c;
   }
@@ -262,8 +260,7 @@
       stats.append(
         stat("ccu", fmt(g.ccu), "playing"),
         stat("", fmt(g.visits), "visits"),
-        stat("", fmt(g.favorites), "favorites"),
-        stat("", g.ratio + "%", "engagement")
+        stat("", fmt(g.favorites), "favorites")
       );
 
       const links = el("div", "links");
@@ -300,7 +297,6 @@
     }
     if (!scanning && s.last_updated) bits.push("Updated " + new Date(s.last_updated).toLocaleString());
     if (!scanning && s.analyzed) bits.push(`${fmt(s.analyzed)} checked`);
-    if (!scanning && s.botted) bits.push(`${fmt(s.botted)} dropped as likely botted`);
     $("meta").textContent = bits.join("  ·  ");
 
     const err = $("error");
@@ -309,8 +305,7 @@
 
     const c = s.config;
     $("criteria").textContent =
-      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits, ` +
-      `engagement below ${c.max_ratio}%`;
+      `At least ${fmt(c.min_ccu)} players now, under ${fmt(c.max_visits)} visits`;
   }
 
   async function refresh() {
