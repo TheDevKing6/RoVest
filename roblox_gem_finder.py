@@ -40,7 +40,7 @@ INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 # ----------------------------- FILTER CRITERIA -----------------------------
 MIN_CCU = int(os.environ.get("MIN_CCU", 350))              # minimum players right now
-MAX_VISITS = int(os.environ.get("MAX_VISITS", 400_000))    # maximum total visits
+MAX_VISITS = int(os.environ.get("MAX_VISITS", 500_000))    # maximum total visits
 
 # ------------------------------- SETTINGS ----------------------------------
 PORT = int(os.environ.get("PORT", 5000))
