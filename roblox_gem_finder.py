@@ -35,7 +35,13 @@ import requests
 from flask import Flask, Response, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # so queries.py is found from any folder
-from queries import MODES, build_plan, name_terms   # keyword banks and the search plan (queries.py)
+try:
+    from queries import MODES, build_plan, name_terms   # keyword banks and the search plan (queries.py)
+except ImportError:
+    raise SystemExit(
+        "\n❌ queries.py is missing.\n"
+        "   It must sit in the same folder as roblox_gem_finder.py. Upload queries.py to your repo.\n"
+        "   If you deploy with a Dockerfile, use the one that says  COPY *.py index.html ./  so it gets copied.\n")
 
 app = Flask(__name__)
 
@@ -43,7 +49,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 # ----------------------------- FILTER CRITERIA -----------------------------
-MIN_CCU = int(os.environ.get("MIN_CCU", 100))              # minimum players right now
+MIN_CCU = int(os.environ.get("MIN_CCU", 350))              # minimum players right now
 MAX_VISITS = int(os.environ.get("MAX_VISITS", 500_000))    # maximum total visits
 
 # ------------------------------- SETTINGS ----------------------------------
