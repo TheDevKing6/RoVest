@@ -219,6 +219,24 @@
   }
   .crow .btn { height: 30px; padding: 0 10px; font-size: .82rem; }
 
+  .icon-btn.on { color: var(--accent); border-color: var(--accent); }
+  dialog {
+    border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--text);
+    padding: 0; width: min(430px, calc(100% - 32px)); margin: auto; box-shadow: 0 20px 50px rgba(0, 0, 0, .25);
+  }
+  dialog::backdrop { background: var(--overlay); }
+  .od { padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .od h2 { font-size: 1.15rem; font-weight: 650; letter-spacing: -.01em; }
+  .od p { color: var(--muted); font-size: .88rem; }
+  .od input[type="password"], .od select {
+    width: 100%; height: 40px; border: 1px solid var(--line); border-radius: 9px; padding: 0 12px; background: var(--bg);
+  }
+  .od .fld { display: flex; flex-direction: column; gap: 6px; font-size: .84rem; font-weight: 600; }
+  .od .chk { display: flex; gap: 8px; align-items: center; font-size: .86rem; color: var(--muted); }
+  .orow { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .oerr { color: var(--down); font-size: .86rem; }
+  #odiag { background: var(--soft); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; font-size: .78rem;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; font-family: Consolas, "SF Mono", Menlo, monospace; }
   .toast {
     position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; transition: .2s; z-index: 80;
     background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 9px; font-size: .86rem; font-weight: 550; pointer-events: none;
@@ -255,6 +273,7 @@
     <div class="bar-actions">
       <button class="btn" id="stop" hidden>Stop</button>
       <button class="btn primary" id="rescan" hidden>Rescan</button>
+      <button class="icon-btn" id="owner" aria-label="Owner login" title="Owner login" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="12" height="8" rx="2"/><path d="M7 9V6.5a3 3 0 016 0V9"/></svg></button>
       <button class="icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button>
     </div>
   </div>
@@ -291,6 +310,7 @@
       <option value="50000">Under 50K visits</option>
       <option value="100000">Under 100K visits</option>
       <option value="200000">Under 200K visits</option>
+      <option value="300000">Under 300K visits</option>
     </select>
     <select id="sort" aria-label="Sort by">
       <option value="ccu">Most players</option>
@@ -312,11 +332,38 @@
 
 <footer>
   <div id="updated">&nbsp;</div>
-  <div style="margin-top:6px">Unofficial, not affiliated with Roblox Corporation. Numbers come from Roblox's public web APIs.<a href="#" id="adminlink" hidden>Admin</a></div>
+  <div style="margin-top:6px">Unofficial, not affiliated with Roblox Corporation. Numbers come from Roblox's public web APIs.</div>
 </footer>
 
 <div class="backdrop" id="backdrop"></div>
 <aside class="panel" id="panel" aria-hidden="true" aria-label="Game details"><div class="p-in" id="pin"></div></aside>
+<dialog id="ownerdlg" aria-labelledby="odt">
+  <form class="od" id="oform" autocomplete="on">
+    <h2 id="odt">Owner</h2>
+    <div id="ologin" style="display:flex;flex-direction:column;gap:12px">
+      <p id="ointro">Enter your owner password to rescan for new games.</p>
+      <input type="text" name="username" value="owner" autocomplete="username" hidden>
+      <label class="fld">Password<input type="password" id="opass" name="password" autocomplete="current-password" placeholder="Owner password"></label>
+      <label class="chk"><input type="checkbox" id="oremember" checked> Remember me on this device</label>
+      <div class="oerr" id="oerr" hidden></div>
+      <div class="orow"><button type="button" class="btn" id="ocancel">Cancel</button><button type="submit" class="btn primary" id="osubmit">Sign in</button></div>
+    </div>
+    <div id="otools" style="display:none;flex-direction:column;gap:12px">
+      <label class="fld">Scan size
+        <select id="omode">
+          <option value="quick">Quick</option><option value="standard">Standard</option>
+          <option value="deep">Deep</option><option value="max">Max</option>
+        </select>
+      </label>
+      <p id="ohint"></p>
+      <p id="ostatus"></p>
+      <pre id="odiag" hidden></pre>
+      <div class="orow"><button type="button" class="btn" id="otrack">Refresh player counts</button><button type="button" class="btn primary" id="oscan">Start scan</button></div>
+      <div class="orow"><button type="button" class="btn" id="odiagbtn">Test connection</button><button type="button" class="btn" id="ostop">Stop scan</button><button type="button" class="btn" id="osignout">Sign out</button><button type="button" class="btn" id="oclose">Close</button></div>
+    </div>
+  </form>
+</dialog>
+
 <div class="toast" id="toast" role="status"></div>
 
 <script>
@@ -389,8 +436,25 @@
   };
   const dataUrl = () => STATIC ? "state.json?t=" + Date.now() : "/api/state";
   const histUrl = (id) => STATIC ? "h/" + id + ".json?t=" + Date.now() : "/api/history/" + id;
-  const token = () => store.get("hg_token", "");
+  const ss = {
+    get() { try { return sessionStorage.getItem("hg_token") || ""; } catch (e) { return ""; } },
+    set(v) { try { sessionStorage.setItem("hg_token", v); } catch (e) {} },
+    del() { try { sessionStorage.removeItem("hg_token"); } catch (e) {} },
+  };
+  const token = () => store.get("hg_token", "") || ss.get();
+  const tokenSave = (t, remember) => { tokenClear(); if (remember) store.set("hg_token", t); else ss.set(t); };
+  const tokenClear = () => { store.del("hg_token"); ss.del(); };
   const auth = () => ({ "X-Admin-Token": token() });
+  const MODE_INFO = {
+    quick: "About 500 searches. A few minutes.",
+    standard: "About 3,000 searches. Roughly 15 to 40 minutes.",
+    deep: "About 10,000 searches. Around an hour.",
+    max: "About 64,000 searches, including a 3-letter crawl. Many hours and a lot of data.",
+  };
+  const currentMode = () => {
+    const m = store.get("hg_mode", "") || (S.data && S.data.config && S.data.config.default_mode) || "deep";
+    return MODE_INFO[m] ? m : "deep";
+  };
 
   // ---------------------------------------------------------------- theme
   function applyTheme(t) {
@@ -545,13 +609,15 @@
     const c = d.config || {};
     $("lede").textContent = "Games with " + nf.format(c.min_ccu || 0) + "+ players and under " + compact(c.max_visits || 0) +
       " total visits. Click any game to see its player count over time.";
-    $("updated").textContent = d.last_updated ? "Updated " + ago(d.last_updated) : "Waiting for the first update";
+    $("updated").textContent = d.last_updated
+      ? "Updated " + ago(d.last_updated) + (d.last_scan ? " · last full scan " + ago(d.last_scan) : "")
+      : "Waiting for the first update";
 
     const scanning = d.status === "scanning" && !STATIC;
     $("scanbar").hidden = !scanning;
     if (scanning) {
       const eta = d.eta_seconds != null ? " · about " + (d.eta_seconds >= 5400 ? (d.eta_seconds / 3600).toFixed(1) + " h" : Math.max(1, Math.round(d.eta_seconds / 60)) + " min") + " left" : "";
-      $("scantext").textContent = "Refreshing data · " + (d.stage || "") + eta;
+      $("scantext").textContent = "Refreshing data · " + (d.mode ? d.mode + " scan · " : "") + (d.stage || "") + eta;
       $("scanfill").style.width = (d.progress || 0) + "%";
     }
     $("errbar").hidden = !d.error;
@@ -559,8 +625,10 @@
     const canScan = S.admin && !STATIC;
     $("rescan").hidden = !canScan; $("rescan").disabled = scanning; $("rescan").textContent = scanning ? "Scanning…" : "Rescan";
     $("stop").hidden = !(canScan && scanning);
-    $("adminlink").hidden = STATIC;
-    $("adminlink").textContent = S.admin && token() ? "Sign out" : "Admin";
+    $("owner").hidden = STATIC;
+    $("owner").classList.toggle("on", S.admin);
+    $("owner").title = S.admin ? "Owner tools" : "Owner login";
+    if ($("ownerdlg").open) renderOwner();
   }
 
   // ---------------------------------------------------------------- loading
@@ -813,26 +881,107 @@
   $("sort").addEventListener("change", e => { S.sort = e.target.value; store.set("hg_sort", S.sort); S.shown = 100; renderList(); });
   $("maxv").addEventListener("change", e => { S.maxv = +e.target.value; store.set("hg_maxv", String(S.maxv)); S.shown = 100; renderList(); });
 
-  // admin (server mode only)
+  // owner tools (server mode only)
   async function checkAdmin() {
     if (STATIC) return;
-    try { const r = await fetch("/api/me", { headers: auth() }); S.admin = (await r.json()).admin === true; } catch (e) { S.admin = false; }
+    try {
+      const r = await fetch("/api/me", { headers: auth(), cache: "no-store" });
+      const j = await r.json();
+      S.admin = j.admin === true; S.ownerEnabled = j.owner_enabled !== false;
+    } catch (e) { S.admin = false; }
     renderMeta();
   }
-  $("adminlink").addEventListener("click", e => {
+  async function post(url, body) {
+    const r = await fetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, auth()), body: JSON.stringify(body || {}) });
+    if (r.status === 403) { S.admin = false; renderMeta(); toast("Signed out. Sign in again."); return null; }
+    return r.json().catch(() => ({}));
+  }
+  function ownerErr(msg) { const e = $("oerr"); e.textContent = msg; e.hidden = !msg; }
+  function renderOwner() {
+    const scanning = S.data && S.data.status === "scanning";
+    $("ologin").style.display = S.admin ? "none" : "flex";
+    $("otools").style.display = S.admin ? "flex" : "none";
+    $("odt").textContent = S.admin ? "Owner tools" : "Owner login";
+    if (!S.admin) {
+      $("ointro").textContent = S.ownerEnabled === false
+        ? "Owner tools aren't set up yet. Set an ADMIN_TOKEN on the server, then come back."
+        : "Enter your owner password to rescan for new games.";
+      return;
+    }
+    $("omode").value = currentMode();
+    $("ohint").textContent = MODE_INFO[$("omode").value];
+    $("ostatus").textContent = scanning
+      ? "A scan is running: " + ((S.data.mode || "") + " · " + (S.data.stage || "")).replace(/^ · /, "")
+      : S.data && S.data.last_scan ? "Last full scan " + ago(S.data.last_scan) + "." : "No full scan yet.";
+    $("oscan").disabled = scanning; $("otrack").disabled = scanning; $("ostop").disabled = !scanning;
+  }
+  function openOwner() {
+    renderOwner(); ownerErr("");
+    if (!$("ownerdlg").open) $("ownerdlg").showModal();
+    if (!S.admin) $("opass").focus();
+  }
+  $("owner").addEventListener("click", openOwner);
+  $("ocancel").addEventListener("click", () => $("ownerdlg").close());
+  $("oclose").addEventListener("click", () => $("ownerdlg").close());
+  $("oform").addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (S.admin && token()) store.del("hg_token");
-    else { const t = prompt("Admin token:"); if (t) store.set("hg_token", t.trim()); }
-    checkAdmin();
+    if (S.admin) return;
+    const pw = $("opass").value.trim();
+    if (!pw) { ownerErr("Enter your password."); return; }
+    $("osubmit").disabled = true; ownerErr("");
+    try {
+      const r = await fetch("/api/me", { headers: { "X-Admin-Token": pw }, cache: "no-store" });
+      const j = await r.json();
+      if (j.admin) {
+        tokenSave(pw, $("oremember").checked); $("opass").value = "";
+        await checkAdmin(); renderOwner(); toast("Signed in");
+      } else ownerErr(j.locked ? "Too many wrong attempts. Try again in 10 minutes." : "Wrong password.");
+    } catch (err) { ownerErr("Couldn't reach the server."); }
+    $("osubmit").disabled = false;
   });
+  $("omode").addEventListener("change", () => { store.set("hg_mode", $("omode").value); $("ohint").textContent = MODE_INFO[$("omode").value]; });
+  $("oscan").addEventListener("click", async () => {
+    const mode = $("omode").value; store.set("hg_mode", mode);
+    const j = await post("/api/rescan", { mode });
+    if (j) { toast(j.started ? "Scan started" : "A scan is already running"); $("ownerdlg").close(); load(); }
+  });
+  $("otrack").addEventListener("click", async () => {
+    const j = await post("/api/track");
+    if (j) { toast(j.started ? "Refreshing player counts" : "A scan is running"); $("ownerdlg").close(); setTimeout(load, 4000); }
+  });
+  $("ostop").addEventListener("click", async () => {
+    const j = await post("/api/cancel"); if (j) { toast("Stopping the scan"); setTimeout(load, 1500); }
+  });
+  let diagTimer;
+  async function pollDiag() {
+    clearTimeout(diagTimer);
+    try {
+      const r = await fetch("/api/diagnose", { headers: auth(), cache: "no-store" });
+      if (r.status === 403) return;
+      const j = await r.json();
+      const box = $("odiag");
+      if (j.lines && j.lines.length) { box.hidden = false; box.textContent = j.lines.join("\n"); box.scrollTop = box.scrollHeight; }
+      $("odiagbtn").disabled = !!j.running;
+      $("odiagbtn").textContent = j.running ? "Testing…" : "Test connection";
+      if (j.running) diagTimer = setTimeout(pollDiag, 2000);
+    } catch (e) {}
+  }
+  $("odiagbtn").addEventListener("click", async () => {
+    const j = await post("/api/diagnose");
+    if (!j) return;
+    if (!j.started && !j.running) { toast(j.scanning ? "Wait for the scan to finish first" : "Couldn't start the test"); return; }
+    pollDiag();
+  });
+  $("osignout").addEventListener("click", async () => { tokenClear(); await checkAdmin(); renderOwner(); toast("Signed out"); });
   $("rescan").addEventListener("click", async () => {
     $("rescan").disabled = true;
-    await fetch("/api/rescan", { method: "POST", headers: auth() });
+    const j = await post("/api/rescan", { mode: currentMode() });
+    if (j) toast(j.started ? "Scan started (" + currentMode() + ")" : "A scan is already running");
     load();
   });
   $("stop").addEventListener("click", async () => {
     $("stop").disabled = true;
-    await fetch("/api/cancel", { method: "POST", headers: auth() });
+    await post("/api/cancel");
     setTimeout(() => { $("stop").disabled = false; load(); }, 1500);
   });
 
